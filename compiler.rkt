@@ -22,7 +22,7 @@
       [(Prim op es)
        (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
       [_ (error "Unrecognized expression (uniquify_exp)")])))
-       
+
 ;; uniquify : R1 -> R1
 (define (uniquify p)
   (match p
@@ -105,14 +105,12 @@
     [(Prim '- (list e1)) (list
                           (Instr 'movq (list (select-instructions-atm e1) x))
                           (Instr 'negq (list x)))]
-    [(Prim op (list e1 e2)) #:when (equal? e1 x) (list
-                                                  (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
-    [(Prim op (list e1 e2)) #:when (equal? e2 x) (list
-                                                  (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
+    [(Prim op (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
+    [(Prim op (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
     [(Prim op (list e1 e2)) (list
-                             (Instr 'movq            (list (select-instructions-atm e1) x))
+                             (Instr 'movq                  (list (select-instructions-atm e1) x))
                              (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]))
-    
+
 (define (select-instructions-stmt stmt)
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
@@ -146,7 +144,7 @@
     [(Imm n) (Imm n)]
     [(Reg r) (Reg r)]
     [(Var x) (Deref 'rbp (* (- 8) (get-location x env)))]))
-    
+
 (define (assign-homes-instruction i env)
   (match i
     [(Instr name (list arg))       (Instr name (list (assign-homes-imm arg env)))]
@@ -188,16 +186,16 @@
 
 (define (generate-conclusion info)
   (list (cons 'conclusion (Block '()
-                           (list
-                            (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
-                            (Instr 'popq (list (Reg 'rbp)))
-                            (Retq))))))
+                                 (list
+                                  (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
+                                  (Instr 'popq (list (Reg 'rbp)))
+                                  (Retq))))))
 
 ;; prelude-and-conclusion : X86 -> X86
 (define (prelude-and-conclusion p)
   (match p
     [(X86Program info block) (X86Program info (append (generate-prelude info) block (generate-conclusion info)))]))
-     
+
 
 
 ;; Define the compiler passes to be used by interp-tests and the grader
