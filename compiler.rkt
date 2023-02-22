@@ -9,6 +9,7 @@
 (require "type-check-Lvar.rkt")
 (require "type-check-Cvar.rkt")
 (require "utilities.rkt")
+(require "graph-printing.rkt")
 (provide (all-defined-out))
 
 (define (uniquify-exp env)
@@ -55,7 +56,7 @@
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
     [(Prim 'read '()) (Prim 'read '())]
     [(Prim op es)
-     (define-values (es_new env_new) (for/lists (ee env) [(e es)] (rco-atom e)))
+     (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
      (env-to-let (append* env_new) (Prim op es_new))]
     [_ (error "Unrecognized expression (rco-exp)")]))
 
@@ -106,9 +107,9 @@
     [(Prim '- (list e1)) (list
                           (Instr 'movq (list (select-instructions-atm e1) x))
                           (Instr 'negq (list x)))]
-    [(Prim op (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
-    [(Prim op (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
-    [(Prim op (list e1 e2)) (list
+    [(Prim _ (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
+    [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
+    [(Prim _ (list e1 e2)) (list
                              (Instr 'movq                  (list (select-instructions-atm e1) x))
                              (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]))
 
@@ -121,7 +122,7 @@
   (match e
     [(Seq fst snd) (append (select-instructions-stmt fst) (select-instructions-tail snd))]
     [(Return (Prim 'read '())) (list (Callq 'read_int 1) (Jmp 'conclusion))]
-    [(Return x) (append (select-instructions-stmt e) (list (Jmp 'conclusion)))]))
+    [(Return _) (append (select-instructions-stmt e) (list (Jmp 'conclusion)))]))
 
 ;; select-instructions : C0 -> pseudo-X86
 (define (select-instructions p)
@@ -186,12 +187,11 @@
      (when (not (Imm? s)) (add-vertex! graph s))
      (when (not (Imm? d)) (add-vertex! graph d))
      (for ([v (set-subtract live-after (set s d))])
-       (add-vertex! graph v) (add-edge! graph d v))
-     graph]
+       (add-vertex! graph v) (add-edge! graph d v))]
     [_ (define w (get-write instr))
        (for* ([d w] [v (set-subtract live-after w) ])
-         (add-vertex! graph v) (add-edge! graph d v))
-       graph]))
+         (add-vertex! graph v) (add-edge! graph d v))])
+  graph)
 
 ;; build-interference : pseudo X86 -> pseudo X86
 (define (build-interference p)
@@ -202,6 +202,7 @@
          [(Block blkinfo blkbody)
           (define live-after-sets (dict-ref blkinfo 'live-after))
           (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
+     ;; (print-graph interference-graph)
      (X86Program (dict-set info 'conflicts interference-graph) (list (cons 'start t)))]))
 
 
@@ -242,7 +243,7 @@
   (match i
     [(Instr name (list arg1 arg2)) #:when (and (Deref? arg1) (Deref? arg2))
                                    (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
-    [else (list i)]))
+    [_ (list i)]))
 
 ;; assign-homes : pseudo-X86 -> X86
 (define (patch-instructions p)
