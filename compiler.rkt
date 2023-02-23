@@ -10,6 +10,7 @@
 (require "type-check-Cvar.rkt")
 (require "utilities.rkt")
 (require "graph-printing.rkt")
+(require "priority_queue.rkt")
 (provide (all-defined-out))
 
 (define (uniquify-exp env)
@@ -110,8 +111,8 @@
     [(Prim _ (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
     [(Prim _ (list e1 e2)) (list
-                             (Instr 'movq                  (list (select-instructions-atm e1) x))
-                             (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]))
+                            (Instr 'movq                  (list (select-instructions-atm e1) x))
+                            (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]))
 
 (define (select-instructions-stmt stmt)
   (match stmt
@@ -202,47 +203,131 @@
          [(Block blkinfo blkbody)
           (define live-after-sets (dict-ref blkinfo 'live-after))
           (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
-     ;; (print-graph interference-graph)
      (X86Program (dict-set info 'conflicts interference-graph) (list (cons 'start t)))]))
 
 
-(define (calculate-stack-frame env)
-  (cond
-    [(eq? (remainder (length env) 16) 0) (* 8 (length env))]
-    [else (* 8 (+ (length env) 1))]))
+(define reg->color
+  (list (cons (Reg 'r15) -5)
+        (cons (Reg 'r11) -4)
+        (cons (Reg 'rbp) -3)
+        (cons (Reg 'rsp) -2)
+        (cons (Reg 'rax) -1)
+        (cons (Reg 'rcx)  0)
+        (cons (Reg 'rdx)  1)
+        (cons (Reg 'rsi)  2)
+        (cons (Reg 'rdi)  3)
+        (cons (Reg 'r8)   4)
+        (cons (Reg 'r9)   5)
+        (cons (Reg 'r10)  6)
+        (cons (Reg 'rbx)  7)
+        (cons (Reg 'r12)  8)
+        (cons (Reg 'r13)  9)
+        (cons (Reg 'r14) 10)))
 
-(define (get-location x env)
-  (cond
-    [(eq? (length env) 0) 0]
-    [(eq? x (car (car env))) 1]
-    [else (+ 1 (get-location x (cdr env)))]))
+(define color->reg
+  (list (cons  0  (Reg 'rcx))
+        (cons  1  (Reg 'rdx))
+        (cons  2  (Reg 'rsi))
+        (cons  3  (Reg 'rdi))
+        (cons  4  (Reg 'r8))
+        (cons  5  (Reg 'r9))
+        (cons  6  (Reg 'r10))
+        (cons  7  (Reg 'rbx))
+        (cons  8  (Reg 'r12))
+        (cons  9  (Reg 'r13))
+        (cons  10 (Reg 'r14))))
 
-(define (assign-homes-imm i env)
+(define (get-color s i)
+  (if (set-member? s i) (get-color s (+ i 1)) i))
+
+(define (color-graph graph vars)
+  ;; vertices are stored in queue as pairs of vertex, priority
+  (define variables (map (lambda (v) (Var (car v))) vars))
+  (define vertex->saturation (map (lambda (v)
+                                    (cons v (list->set
+                                             (foldl (lambda (u res)
+                                                      (match u
+                                                        [(Reg _) (cons (dict-ref reg->color u) res)]
+                                                        [_ res]))
+                                                    '() (get-neighbors graph v)))))
+                                  (get-vertices graph)))
+  (define q (make-pqueue (lambda (a b) (> (set-count (cdr a))
+                                          (set-count (cdr b))))))
+  (define vertex->handle (foldl (lambda (v res)
+                                  (dict-set res v (pqueue-push! q (cons v (dict-ref vertex->saturation v)))))
+                                '() variables))
+  (define (dsatur colors handles saturation)
+    (define (update-saturation u h s c)
+      (cond
+        [(dict-has-key? h u)
+         (define old-sat (dict-ref s u))
+         (define new-sat (set-union old-sat (set c)))
+         (define handle (dict-ref h u))
+         (set-node-key! handle (cons u new-sat))
+         (pqueue-decrease-key! q (dict-ref h u))
+         (dict-set s u new-sat)]
+        [else s]))
+    (let* ([v (car (pqueue-pop! q))]
+           [color (get-color (dict-ref saturation v) 0)]
+           [var->color       (dict-set colors v color)]
+           [var->handle      (dict-remove handles v)]
+           [var->saturation (foldl (lambda (u res)
+                                     (update-saturation u var->handle res color))
+                                   saturation (get-neighbors graph v))])
+      (if (equal? (pqueue-count q) 0)
+          var->color (dsatur var->color var->handle var->saturation))))
+  (if (equal? (pqueue-count q) 0) '() (dsatur '() vertex->handle vertex->saturation)))
+
+
+(define (get-location var->color)
+  (define var (car var->color))
+  (define color (cdr var->color))
+  (cond
+    [(dict-has-key? color->reg color) (cons var (dict-ref color->reg color))]
+    [else                             (cons var (Deref 'rbp (* (-8) (- color 10))))]
+    ))
+
+(define (allocate-registers-imm i var->location)
   (match i
     [(Imm n) (Imm n)]
     [(Reg r) (Reg r)]
-    [(Var x) (Deref 'rbp (* (- 8) (get-location x env)))]))
+    [(Var _) (dict-ref var->location i)]))
 
-(define (assign-homes-instruction i env)
-  (match i
-    [(Instr name (list arg))       (Instr name (list (assign-homes-imm arg env)))]
-    [(Instr name (list arg1 arg2)) (Instr name (list (assign-homes-imm arg1 env) (assign-homes-imm arg2 env)))]
-    [_ i]
-    ))
+(define (allocate-registers-instr instr result var->location)
+  (match instr
+    [(Instr name (list arg))        (cons (Instr name (list (allocate-registers-imm arg  var->location))) result)]
+    [(Instr name (list arg1 arg2))  (cons (Instr name (list (allocate-registers-imm arg1 var->location)
+                                                            (allocate-registers-imm arg2 var->location))) result)]
+    [_                              (cons instr result)]))
 
-;; assign-homes : pseudo-X86 -> pseudo-X86
-(define (assign-homes p)
+(define (get-used-callee x result)
+  (match x
+    [(cons (Var _) (Reg r)) (cond [(list? (member (Reg r) callee-saved-list)) (set-add result (Reg r))]
+                                  [else result])]
+    [_ result]))
+
+;; allocate-registers : pseudoX86 -> X86
+(define (allocate-registers p)
   (match p
-    [(X86Program info
-                 (list (cons 'start (Block blkinfo blkbody))))
-     (X86Program (dict-set info 'stack-space (calculate-stack-frame (dict-ref info 'locals-types)))
-                 (list (cons 'start (Block blkinfo (for/list ([instr blkbody])
-                                                     (assign-homes-instruction instr (dict-ref info 'locals-types)))))))]))
+    [(X86Program info (list (cons 'start (Block blkinfo blkbody))))
+     (define graph      (dict-ref info 'conflicts))
+     (define variables  (dict-ref info 'locals-types)) 
+     (define var->color (color-graph graph variables))
+     (define var->location (map get-location var->color))
+     (define num-spilled (foldl (lambda (x result) (if (Deref? (car x)) (+ 1 result) result)) 0 var->location)) 
+     (define used-callee (foldl get-used-callee (set) var->location)) 
+     (define num-callee  (set-count used-callee))
+     (define stack-space (- (align (* 8 (+ num-spilled num-callee)) 16) (* 8 num-callee)))
+     (X86Program (dict-set* info 'stack-space stack-space 'used-callee used-callee) 
+                 (list (cons 'start (Block blkinfo (foldr (lambda (instr result)
+                                                            (allocate-registers-instr instr result var->location))
+                                                          '() blkbody)))))]))
 
 (define (patch-single-instruction i)
   (match i
-    [(Instr name (list arg1 arg2)) #:when (and (Deref? arg1) (Deref? arg2))
-                                   (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
+    [(Instr 'movq (list arg1 arg2))  #:when (equal? arg1 arg2) (list)]
+    [(Instr name (list arg1 arg2))   #:when (and (Deref? arg1) (Deref? arg2))
+                                     (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
     [_ (list i)]))
 
 ;; assign-homes : pseudo-X86 -> X86
@@ -253,27 +338,33 @@
                                                          (lambda (instr old)
                                                            (append (patch-single-instruction instr) old)) '() blkbody)))))]))
 
+
 (define (generate-prelude info)
   (list (cons 'main (Block '()
-                           (list
-                            (Instr 'pushq (list (Reg 'rbp)))
-                            (Instr 'movq (list (Reg 'rsp) (Reg 'rbp)))
-                            (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
-                            (Jmp 'start))))))
+                           (append
+                            (list
+                             (Instr 'pushq (list (Reg 'rbp)))
+                             (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+                            (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                            (list
+                             (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
+                             (Jmp 'start)))))))
 
 
 (define (generate-conclusion info)
   (list (cons 'conclusion (Block '()
-                                 (list
-                                  (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
-                                  (Instr 'popq (list (Reg 'rbp)))
-                                  (Retq))))))
+                                 (append
+                                  (list
+                                   (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                  (foldr (lambda (r res) (cons (Instr 'popq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                                  (list
+                                   (Instr 'popq (list (Reg 'rbp)))
+                                   (Retq)))))))
 
 ;; prelude-and-conclusion : X86 -> X86
 (define (prelude-and-conclusion p)
   (match p
     [(X86Program info block) (X86Program info (append (generate-prelude info) block (generate-conclusion info)))]))
-
 
 
 ;; Define the compiler passes to be used by interp-tests and the grader
@@ -288,7 +379,8 @@
     ("instruction selection", select-instructions ,interp-x86-0)
     ("uncover live", uncover-live ,interp-x86-0)
     ("build interference", build-interference ,interp-x86-0)
-    ("assign homes", assign-homes ,interp-x86-0)
+    ; ("assign homes", assign-homes ,interp-x86-0)
+    ("allocate registers", allocate-registers ,interp-x86-0)
     ("patch instructions", patch-instructions ,interp-x86-0)
     ("prelude and conclusion", prelude-and-conclusion ,interp-x86-0)
     ))
