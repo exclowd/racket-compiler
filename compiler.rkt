@@ -284,7 +284,7 @@
   (define color (cdr var->color))
   (cond
     [(dict-has-key? color->reg color) (cons var (dict-ref color->reg color))]
-    [else                             (cons var (Deref 'rbp (* (-8) (- color 10))))]
+    [else                             (cons var (Deref 'rbp (* -8 (- color 10))))]
     ))
 
 (define (allocate-registers-imm i var->location)
@@ -314,7 +314,7 @@
      (define variables  (dict-ref info 'locals-types)) 
      (define var->color (color-graph graph variables))
      (define var->location (map get-location var->color))
-     (define num-spilled (foldl (lambda (x result) (if (Deref? (car x)) (+ 1 result) result)) 0 var->location)) 
+     (define num-spilled (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 var->location)) 
      (define used-callee (foldl get-used-callee (set) var->location)) 
      (define num-callee  (set-count used-callee))
      (define stack-space (- (align (* 8 (+ num-spilled num-callee)) 16) (* 8 num-callee)))
