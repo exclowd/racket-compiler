@@ -327,7 +327,7 @@
   (match b
     [(Block info blkbody)
      (define live-after-sets (foldr (lambda (v l) (uncover-live-instr v l label->live)) (list (set)) blkbody))
-     (Block (dict-set info 'live-after live-after-sets) blkbody)]))
+     live-after-sets]))
 
 ;; uncover-live : pseudo-X86 -> pseudo-X86
 (define (uncover-live p)
@@ -342,21 +342,21 @@
                                     [(cons label (Block blkinfo blkbody))
                                      (for ([instr blkbody])
                                        (match instr
+                                         [(Jmp 'conclusion) (void)]
+                                         [(JmpIf _ 'conclusion) (void)]
                                          [(Jmp dest) (add-directed-edge! graph label dest)]
                                          [(JmpIf _ dest) (add-directed-edge! graph label dest)]
                                          [_ (void)]))])
                                   graph)
                                 cfg blocks))
      (define order (tsort (transpose block-graph)))
-     (println order)
-     (println block-graph)
-     (define new-blocks (for/list ([block order])
-                          (match (dict-ref blocks block)
-                            [(cons label (Block blkinfo blkbody))
-                             (define blk-live-after (uncover-live-block blkbody label->live))
+     (define new-blocks (for/list ([label order])
+                          (match (dict-ref blocks label)
+                            [(Block blkinfo blkbody)
+                             (define blk-live-after (uncover-live-block (Block blkinfo blkbody) label->live))
                              (set! label->live (dict-set label->live label (car blk-live-after)))
-                             (cons label (Block (dict-set info 'live-after blk-live-after) blkbody))])))
-     (X86Program info new-blocks)]))
+                             (cons label (Block (dict-set blkinfo 'live-after blk-live-after) blkbody))])))
+     (X86Program (dict-set info 'label->live label->live) new-blocks)]))
 
 
 (define (build-interference-graph instr live-after graph)
@@ -377,11 +377,11 @@
     [(X86Program info blocks)
      (define graph (undirected-graph '()))
      (for/list ([block blocks])
-     (define interference-graph
-       (match block
-         [(Block blkinfo blkbody)
-          (define live-after-sets (dict-ref blkinfo 'live-after))
-          (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
+       (define interference-graph
+         (match block
+           [(cons _ (Block blkinfo blkbody))
+            (define live-after-sets (dict-ref blkinfo 'live-after))
+            (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
      (graph-union! graph interference-graph))
      (X86Program (dict-set info 'conflicts graph) blocks)]))
 
@@ -510,8 +510,15 @@
 (define (patch-single-instruction i)
   (match i
     [(Instr 'movq (list arg1 arg2))  #:when (equal? arg1 arg2) (list)]
+    [(Instr 'movzbq (list arg1 arg2))  #:when (equal? arg1 arg2) (list)]
+    [(Instr 'movzbq (list arg1 arg2))  #:when (Deref? arg2)
+                                       (list (Instr 'movzbq (list arg1 (Reg 'rax)))
+                                             (Instr 'movq (list (Reg 'rax) arg2)))]
     [(Instr name (list arg1 arg2))   #:when (and (Deref? arg1) (Deref? arg2))
                                      (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
+    [(Instr 'compq (list arg1 (Imm arg2))) 
+                                     (list (Instr 'movq  (list (Imm arg2) (Reg 'rax)))
+                                           (Instr 'compq (list arg1 (Reg 'rax))))]
     [_ (list i)]))
 
 ;; assign-homes : pseudo-X86 -> X86
@@ -569,7 +576,7 @@
     ("uncover live", uncover-live ,interp-pseudo-x86-1)
     ("build interference", build-interference ,interp-pseudo-x86-1)
     ; ("assign homes", assign-homes ,interp-x86-0)
-    ("allocate registers", allocate-registers ,interp-x86-0)
-    ("patch instructions", patch-instructions ,interp-x86-0)
-    ("prelude and conclusion", prelude-and-conclusion ,interp-x86-0)
+    ("allocate registers", allocate-registers ,interp-x86-1)
+    ("patch instructions", patch-instructions ,interp-x86-1)
+    ("prelude and conclusion", prelude-and-conclusion ,interp-x86-1)
     ))
