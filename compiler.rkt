@@ -3,27 +3,52 @@
 (require racket/fixnum)
 (require graph)
 (require "interp-Lint.rkt")
-(require "interp-Lvar.rkt")
-(require "interp-Cvar.rkt")
+(require "interp-Lif.rkt")
+(require "interp-Cif.rkt")
 (require "interp.rkt")
-(require "type-check-Lvar.rkt")
-(require "type-check-Cvar.rkt")
+(require "type-check-Lif.rkt")
+(require "type-check-Cif.rkt")
 (require "utilities.rkt")
+(require "multigraph.rkt")
 (require "graph-printing.rkt")
 (require "priority_queue.rkt")
 (provide (all-defined-out))
+
+(define (shrink-exp e)
+  (match e
+    [(Var x) (Var x)]
+    [(Int n) (Int n)]
+    [(Bool b) (Bool b)]
+    [(Let x rhs body) (Let x (shrink-exp rhs) (shrink-exp body))]
+    [(Prim 'and `(,e1 ,e2)) (let ([e1 (shrink-exp e1)]
+                                  [e2 (shrink-exp e2)])
+                              (If e1 e2 (Bool #f)))]
+    [(Prim 'or `(,e1 ,e2))  (let ([e1 (shrink-exp e1)]
+                                  [e2 (shrink-exp e2)])
+                              (If e1 (Bool #t) e2))]
+    [(Prim op es) (Prim op (for/list ([ex es]) (shrink-exp ex)))]
+    [(If c t e) (If (shrink-exp c) (shrink-exp t) (shrink-exp e))]
+    [_ (error "Unrecognized expression (shrink_exp)")])
+  )
+
+(define (shrink p)
+  (match p
+    [(Program info e) (Program info (shrink-exp e))]))
+
 
 (define (uniquify-exp env)
   (lambda (e)
     (match e
       [(Var x) (Var (dict-ref env x))]
       [(Int n) (Int n)]
-      [(Let x e body) (let ([env-new (dict-set env x (gensym x))])
-                        (Let (dict-ref env-new x)
-                             ((uniquify-exp env) e)
-                             ((uniquify-exp env-new) body)))]
+      [(Bool b) (Bool b)]
+      [(Let x rhs body) (let ([env-new (dict-set env x (gensym x))])
+                          (Let (dict-ref env-new x)
+                               ((uniquify-exp env) rhs)
+                               ((uniquify-exp env-new) body)))]
       [(Prim op es)
        (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
+      [(If cnd thn els) (If ((uniquify-exp env) cnd) ((uniquify-exp env) thn) ((uniquify-exp env) els))]
       [_ (error "Unrecognized expression (uniquify_exp)")])))
 
 ;; uniquify : R1 -> R1
@@ -31,20 +56,24 @@
   (match p
     [(Program '() e) (Program '() ((uniquify-exp '()) e))]))
 
+
 (define (rco-atom e)
   (match e
     [(Var x) (values (Var x) '())]
     [(Int n) (values (Int n) '())]
+    [(Bool b) (values (Bool b) '())]
     [(Let x rhs body)
      (define rhs_exp (rco-exp rhs))
      (define-values (body_atm body_env) (rco-atom body))
      (values body_atm (append (list (cons x rhs_exp)) body_env))]
     [(Prim op es)
-     (define-values (es_new env_new) (for/lists (ee env) [(e es)] (rco-atom e)))
      (define tmp (gensym "tmp"))
+     (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
      (values (Var tmp) (append (append* env_new) (list (cons tmp (Prim op es_new)))))]
+    [(If cnd thn els)
+     (define tmp (gensym "tmp"))
+     (values (Var tmp) (list (cons tmp (rco-exp (If (rco-exp cnd) (rco-exp thn) (rco-exp els))))))]
     [_ (error "Unrecognized expression (rco-atom)")]))
-
 
 (define (rco-exp e)
   (define (env-to-let env e)
@@ -54,11 +83,13 @@
   (match e
     [(Var x) (Var x)]
     [(Int n) (Int n)]
+    [(Bool b) (Bool b)]
     [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
     [(Prim 'read '()) (Prim 'read '())]
     [(Prim op es)
      (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
      (env-to-let (append* env_new) (Prim op es_new))]
+    [(If cnd thn els) (If (rco-exp cnd) (rco-exp thn) (rco-exp els))]
     [_ (error "Unrecognized expression (rco-exp)")]))
 
 ;; remove-complex-opera* : R1 -> R1
@@ -66,33 +97,75 @@
   (match p
     [(Program info e) (Program info (rco-exp e))]))
 
+(define basic-blocks (make-hash))
+
+(define (create-block tail)
+  (match tail
+    [(Goto label) (Goto label)]
+    [else
+     (let ([label (gensym 'block)])
+       (dict-set! basic-blocks label tail)
+       (Goto label))]))
+
 (define (explicate-tail e)
   (match e
     [(Var x) (Return (Var x))]
     [(Int n) (Return (Int n))]
+    [(Bool b) (Return (Bool b))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
     [(Prim op es) (Return (Prim op es))]
+    [(If cnd thn els)
+     (define thn-block (create-block (explicate-tail thn)))
+     (define els-block (create-block (explicate-tail els)))
+     (explicate-pred cnd thn-block els-block)]
     [_ (error "Unrecognized expression (explicate-tail)" e)]))
-
 
 (define (explicate-assign e x cont)
   (match e
     [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
+    [(Bool b) (Seq (Assign (Var x) (Bool b)) cont)]
     [(Let y rhs body) (explicate-assign rhs y (explicate-assign body x cont))]
     [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
+    [(If cnd thn els)
+     (define thn-block (explicate-assign thn x cont))
+     (define els-block (explicate-assign els x cont))
+     (explicate-pred cnd thn-block els-block)]
     [_ (error "Unrecognized expression (explicate-assign)" e)]))
 
+(define (explicate-pred cnd thn els)
+  (match cnd
+    [(Var x) (IfStmt (Prim 'eq? (list (Var x) (Bool #t)) (create-block thn) (create-block els)))]
+    [(Let x rhs body) (explicate-assign rhs x (explicate-pred body thn els))]
+    [(Bool b) (if b thn els)]
+    [(Prim 'not (list e)) (explicate-pred e els thn)]
+    [(Prim op es) #:when (or (eq? op 'eq?) (eq? op '<))
+                  (IfStmt (Prim op es) (create-block thn) (create-block els))]
+    [(If cnd^ thn^ els^)
+     (define thn-block (explicate-pred thn^ thn els))
+     (define els-block (explicate-pred els^ thn els))
+     (explicate-pred cnd^ thn-block els-block)]
+    [else (error "explicate_pred unhandled case" cnd)]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
   (match p
-    [(Program info body) (CProgram info (list (cons 'start (explicate-tail body))))]))
+    [(Program info body)
+     (set! basic-blocks (make-hash))
+     (dict-set! basic-blocks 'start (explicate-tail body))
+     (CProgram info (hash->list basic-blocks))]))
+
 
 (define (select-instructions-atm atm)
   (match atm
     [(Int n) (Imm n)]
-    [(Var x) (Var x)]))
+    [(Var x) (Var x)]
+    [(Reg r) (Reg r)]
+    [(ByteReg r) (ByteReg r)]
+    [(Bool b)
+     (match b
+       [#t (Imm 1)]
+       [#f (Imm 0)])]))
 
 (define (select-assign x e)
   (define (get-op-instruction op)
@@ -101,6 +174,12 @@
       [(Prim '- (list _ _)) 'subq]))
   (match e
     [atm #:when (atm? atm) (list (Instr 'movq (list (select-instructions-atm atm) x)))]
+    [(Prim 'not (list e1)) #:when (equal? e1 x)
+                           (list
+                            (Instr 'xorq (list (Imm 1) (select-instructions-atm e1))))]
+    [(Prim 'not (list e1)) (list
+                            (Instr 'movq (list (select-instructions-atm e1) x))
+                            (Instr 'xorq (list (Imm 1) x)))]
     [(Prim 'read '()) (list (Callq 'read_int 1) (Instr 'movq (list (Reg 'rax) x)))]
     [(Prim '- (list e1)) #:when (equal? e1 x)
                          (list
@@ -108,6 +187,26 @@
     [(Prim '- (list e1)) (list
                           (Instr 'movq (list (select-instructions-atm e1) x))
                           (Instr 'negq (list x)))]
+    [(Prim 'eq (list e1 e2)) (list
+                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                              (Instr 'sete (list (ByteReg 'al)))
+                              (Instr 'movzbq (list (Reg 'al) x)))]
+    [(Prim '< (list e1 e2)) (list
+                             (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                             (Instr 'setl (list (ByteReg 'al)))
+                             (Instr 'movzbq (list (Reg 'al) x)))]
+    [(Prim '<= (list e1 e2)) (list
+                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                              (Instr 'setle (list (ByteReg 'al)))
+                              (Instr 'movzbq (list (Reg 'al) x)))]
+    [(Prim '> (list e1 e2)) (list
+                             (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                             (Instr 'setg (list (ByteReg 'al)))
+                             (Instr 'movzbq (list (Reg 'al) x)))]
+    [(Prim '>= (list e1 e2)) (list
+                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                              (Instr 'setge (list (ByteReg 'al)))
+                              (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
     [(Prim _ (list e1 e2)) (list
@@ -123,13 +222,51 @@
   (match e
     [(Seq fst snd) (append (select-instructions-stmt fst) (select-instructions-tail snd))]
     [(Return (Prim 'read '())) (list (Callq 'read_int 1) (Jmp 'conclusion))]
-    [(Return _) (append (select-instructions-stmt e) (list (Jmp 'conclusion)))]))
+    [(Return _) (append (select-instructions-stmt e) (list (Jmp 'conclusion)))]
+    [(Goto l) (list (Jmp l))]
+    [(IfStmt (Prim 'eq? (list arg1 arg2)) (Goto label1) (Goto label2))
+     (define arg1^ (select-instructions-atm arg1))
+     (define arg2^ (select-instructions-atm arg2))
+     (list
+      (Instr 'cmpq (list arg2^ arg1^))
+      (JmpIf 'e label1)
+      (Jmp label2))]
+    [(IfStmt (Prim '< (list arg1 arg2)) (Goto label1) (Goto label2))
+     (define arg1^ (select-instructions-atm arg1))
+     (define arg2^ (select-instructions-atm arg2))
+     (list
+      (Instr 'cmpq (list arg2^ arg1^))
+      (JmpIf 'l label1)
+      (Jmp label2))]
+    [(IfStmt (Prim '<= (list arg1 arg2)) (Goto label1) (Goto label2))
+     (define arg1^ (select-instructions-atm arg1))
+     (define arg2^ (select-instructions-atm arg2))
+     (list
+      (Instr 'cmpq (list arg2^ arg1^))
+      (JmpIf 'le label1)
+      (Jmp label2))]
+    [(IfStmt (Prim '> (list arg1 arg2)) (Goto label1) (Goto label2))
+     (define arg1^ (select-instructions-atm arg1))
+     (define arg2^ (select-instructions-atm arg2))
+     (list
+      (Instr 'cmpq (list arg2^ arg1^))
+      (JmpIf 'g label1)
+      (Jmp label2))]
+    [(IfStmt (Prim '>= (list arg1 arg2)) (Goto label1) (Goto label2))
+     (define arg1^ (select-instructions-atm arg1))
+     (define arg2^ (select-instructions-atm arg2))
+     (list
+      (Instr 'cmpq (list arg2^ arg1^))
+      (JmpIf 'ge label1)
+      (Jmp label2))]))
 
 ;; select-instructions : C0 -> pseudo-X86
 (define (select-instructions p)
   (match p
-    [(CProgram info (list (cons 'start t)))
-     (X86Program info (list (cons 'start (Block '() (select-instructions-tail t)))))]))
+    [(CProgram info blocks)
+     (println (first blocks))
+     (define new-blocks (for/list ([block blocks]) (cons (car block) (Block '() (select-instructions-tail (cdr block))))))
+     (X86Program info new-blocks)]))
 
 
 (define caller-saved-list (list (Reg 'rax) (Reg 'rcx) (Reg 'rdx) (Reg 'rsi) (Reg 'rdi) (Reg 'r8) (Reg 'r9) (Reg 'r10) (Reg 'r11)))
@@ -137,32 +274,50 @@
 (define callee-saved-list (list (Reg 'rsp) (Reg 'rbp) (Reg 'rbx) (Reg 'r12) (Reg 'r13) (Reg 'r14) (Reg 'r15)))
 
 (define (uncover-live-arg e)
+  (define (get-parent-reg r)
+    (match r
+      [(ByteReg 'al) (Reg 'rax)]
+      [(ByteReg 'ah) (Reg 'rax)]
+      [(ByteReg 'bl) (Reg 'rbx)]
+      [(ByteReg 'bh) (Reg 'rbx)]
+      [(ByteReg 'cl) (Reg 'rcx)]
+      [(ByteReg 'ch) (Reg 'rcx)]
+      [(ByteReg 'dl) (Reg 'rdx)]
+      [(ByteReg 'dh) (Reg 'rdx)]
+      [_ (error "unkown byte reg")]))
   (match e
     [(Var _) (set e)]
     [(Reg _) (set e)]
+    [(ByteReg _) (set (get-parent-reg e))]
     [_ (set)]))
 
 (define (get-write instr)
   (match instr
     [(Instr 'addq (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Instr 'movq (list _ arg2))    (set-union (uncover-live-arg arg2))]
+    [(Instr 'movzbq (list _ arg2))  (set-union (uncover-live-arg arg2))]
     [(Instr 'negq (list arg1))      (set-union (uncover-live-arg arg1))]
+    [(Instr 'xorq (list _ arg2))    (set-union (uncover-live-arg arg2))]
+    [(Instr 'set (list cc arg2))    (set-union (uncover-live-arg arg2))]
     [(Callq _ _) (list->set caller-saved-list)]
-    [(Jmp _) (set)]
-    [_ (error "Unrecognized instruction")]))
+    [_ (set)]))
 
 (define (get-read instr)
   (match instr
     [(Instr 'addq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
     [(Instr 'movq (list arg1 _))    (set-union (uncover-live-arg arg1))]
+    [(Instr 'movzbq (list arg1 _))    (set-union (uncover-live-arg arg1))]
     [(Instr 'negq (list arg))       (set-union (uncover-live-arg arg))]
+    [(Instr 'xorq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
+    [(Instr 'cmpq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
     [(Callq _ arity) (list->set (take callee-saved-list arity))]
-    [(Jmp _) (set)]
-    [_ (error "Unrecognized instruction")]))
+    [_ (set)]))
 
 (define (uncover-live-instr newi previ label->live)
   (match newi
     [(Jmp label) (define jmp-after (dict-ref label->live label))
+                 (cons (set-union jmp-after (car previ)) previ)]
+    [(JmpIf _ label) (define jmp-after (dict-ref label->live label))
                  (cons (set-union jmp-after (car previ)) previ)]
     [_ (define r (get-read newi))
        (define w (get-write newi))
@@ -177,9 +332,31 @@
 ;; uncover-live : pseudo-X86 -> pseudo-X86
 (define (uncover-live p)
   (match p
-    [(X86Program info (list (cons 'start t)))
+    [(X86Program info blocks)
      (define label->live (list(cons 'conclusion (set (Reg 'rax) (Reg 'rsp)))))
-     (X86Program info (list (cons 'start (uncover-live-block t label->live))))]))
+     (define labels (dict-keys blocks))
+     (define cfg (make-multigraph '()))
+     (for/list ([label labels]) (add-vertex! cfg label))
+     (define block-graph (foldl (lambda (block graph)
+                                  (match (dict-ref blocks block)
+                                    [(cons label (Block blkinfo blkbody))
+                                     (for ([instr blkbody])
+                                       (match instr
+                                         [(Jmp dest) (add-directed-edge! graph label dest)]
+                                         [(JmpIf _ dest) (add-directed-edge! graph label dest)]
+                                         [_ (void)]))])
+                                  graph)
+                                cfg blocks))
+     (define order (tsort (transpose block-graph)))
+     (println order)
+     (println block-graph)
+     (define new-blocks (for/list ([block order])
+                          (match (dict-ref blocks block)
+                            [(cons label (Block blkinfo blkbody))
+                             (define blk-live-after (uncover-live-block blkbody label->live))
+                             (set! label->live (dict-set label->live label (car blk-live-after)))
+                             (cons label (Block (dict-set info 'live-after blk-live-after) blkbody))])))
+     (X86Program info new-blocks)]))
 
 
 (define (build-interference-graph instr live-after graph)
@@ -197,13 +374,16 @@
 ;; build-interference : pseudo X86 -> pseudo X86
 (define (build-interference p)
   (match p
-    [(X86Program info (list (cons 'start t)))
+    [(X86Program info blocks)
+     (define graph (undirected-graph '()))
+     (for/list ([block blocks])
      (define interference-graph
-       (match t
+       (match block
          [(Block blkinfo blkbody)
           (define live-after-sets (dict-ref blkinfo 'live-after))
           (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
-     (X86Program (dict-set info 'conflicts interference-graph) (list (cons 'start t)))]))
+     (graph-union! graph interference-graph))
+     (X86Program (dict-set info 'conflicts graph) blocks)]))
 
 
 (define reg->color
@@ -216,8 +396,8 @@
         (cons (Reg 'rdx)  1)
         (cons (Reg 'rsi)  2)
         (cons (Reg 'rdi)  3)
-        (cons (Reg 'r8)   4)
-        (cons (Reg 'r9)   5)
+        (cons (Reg 'r8 )  4)
+        (cons (Reg 'r9 )  5)
         (cons (Reg 'r10)  6)
         (cons (Reg 'rbx)  7)
         (cons (Reg 'r12)  8)
@@ -309,19 +489,23 @@
 ;; allocate-registers : pseudoX86 -> X86
 (define (allocate-registers p)
   (match p
-    [(X86Program info (list (cons 'start (Block blkinfo blkbody))))
+    [(X86Program info blocks)
      (define graph      (dict-ref info 'conflicts))
-     (define variables  (dict-ref info 'locals-types)) 
+     (define variables  (dict-ref info 'locals-types))
      (define var->color (color-graph graph variables))
      (define var->location (map get-location var->color))
-     (define num-spilled (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 var->location)) 
-     (define used-callee (foldl get-used-callee (set) var->location)) 
+     (define num-spilled (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 var->location))
+     (define used-callee (foldl get-used-callee (set) var->location))
      (define num-callee  (set-count used-callee))
      (define stack-space (- (align (* 8 (+ num-spilled num-callee)) 16) (* 8 num-callee)))
-     (X86Program (dict-set* info 'stack-space stack-space 'used-callee used-callee) 
-                 (list (cons 'start (Block blkinfo (foldr (lambda (instr result)
-                                                            (allocate-registers-instr instr result var->location))
-                                                          '() blkbody)))))]))
+     (define new-blocks (for/list ([block blocks])
+                          (match block
+                            [(cons label (Block blkinfo blkbody))
+                             (cons label (Block blkinfo (foldr (lambda (instr result)
+                                                                  (allocate-registers-instr instr result var->location))
+                                                                '() blkbody)))])))
+     (X86Program (dict-set* info 'stack-space stack-space 'used-callee used-callee) new-blocks)]))
+
 
 (define (patch-single-instruction i)
   (match i
@@ -333,10 +517,14 @@
 ;; assign-homes : pseudo-X86 -> X86
 (define (patch-instructions p)
   (match p
-    [(X86Program info (list (cons 'start (Block blkinfo blkbody))))
-     (X86Program info (list (cons 'start (Block blkinfo (foldr
-                                                         (lambda (instr old)
-                                                           (append (patch-single-instruction instr) old)) '() blkbody)))))]))
+    [(X86Program info blocks)
+     (define new-blocks (for/list ([block blocks])
+                          (match block
+                            [(cons label (Block blkinfo blkbody))
+                             (cons 'start (Block blkinfo (foldr
+                                                          (lambda (instr old)
+                                                            (append (patch-single-instruction instr) old)) '() blkbody)))])))
+     (X86Program info new-blocks)]))
 
 
 (define (generate-prelude info)
@@ -364,7 +552,7 @@
 ;; prelude-and-conclusion : X86 -> X86
 (define (prelude-and-conclusion p)
   (match p
-    [(X86Program info block) (X86Program info (append (generate-prelude info) block (generate-conclusion info)))]))
+    [(X86Program info blocks) (X86Program info (append (generate-prelude info) blocks (generate-conclusion info)))]))
 
 
 ;; Define the compiler passes to be used by interp-tests and the grader
@@ -373,12 +561,13 @@
 (define compiler-passes
   `(
     ;; Uncomment the following passes as you finish them.
-    ("uniquify" ,uniquify ,interp-Lvar ,type-check-Lvar)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lvar ,type-check-Lvar)
-    ("explicate control" ,explicate-control ,interp-Cvar ,type-check-Cvar)
-    ("instruction selection", select-instructions ,interp-x86-0)
-    ("uncover live", uncover-live ,interp-x86-0)
-    ("build interference", build-interference ,interp-x86-0)
+    ("shrink" ,shrink ,interp-Lif ,type-check-Lif)
+    ("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lif ,type-check-Lif)
+    ("explicate control" ,explicate-control ,interp-Cif ,type-check-Cif)
+    ("instruction selection", select-instructions ,interp-pseudo-x86-1)
+    ("uncover live", uncover-live ,interp-pseudo-x86-1)
+    ("build interference", build-interference ,interp-pseudo-x86-1)
     ; ("assign homes", assign-homes ,interp-x86-0)
     ("allocate registers", allocate-registers ,interp-x86-0)
     ("patch instructions", patch-instructions ,interp-x86-0)
