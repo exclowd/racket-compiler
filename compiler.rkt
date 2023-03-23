@@ -338,7 +338,7 @@
      (define cfg (make-multigraph '()))
      (for/list ([label labels]) (add-vertex! cfg label))
      (define block-graph (foldl (lambda (block graph)
-                                  (match (dict-ref blocks block)
+                                  (match block
                                     [(cons label (Block blkinfo blkbody))
                                      (for ([instr blkbody])
                                        (match instr
