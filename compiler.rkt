@@ -135,11 +135,11 @@
 
 (define (explicate-pred cnd thn els)
   (match cnd
-    [(Var x) (IfStmt (Prim 'eq? (list (Var x) (Bool #t)) (create-block thn) (create-block els)))]
+    [(Var x) (IfStmt (Prim 'eq? (list (Var x) (Bool #t))) (create-block thn) (create-block els))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-pred body thn els))]
     [(Bool b) (if b thn els)]
     [(Prim 'not (list e)) (explicate-pred e els thn)]
-    [(Prim op es) #:when (or (eq? op 'eq?) (eq? op '<))
+    [(Prim op es) #:when (or (or (or (or (eq? op 'eq?) (eq? op '<)) (eq? op '<= )) (eq? op '> )) (eq? op '>= ))
                   (IfStmt (Prim op es) (create-block thn) (create-block els))]
     [(If cnd^ thn^ els^)
      (define thn-block (explicate-pred thn^ thn els))
@@ -161,7 +161,6 @@
     [(Int n) (Imm n)]
     [(Var x) (Var x)]
     [(Reg r) (Reg r)]
-    [(ByteReg r) (ByteReg r)]
     [(Bool b)
      (match b
        [#t (Imm 1)]
@@ -187,25 +186,25 @@
     [(Prim '- (list e1)) (list
                           (Instr 'movq (list (select-instructions-atm e1) x))
                           (Instr 'negq (list x)))]
-    [(Prim 'eq (list e1 e2)) (list
+    [(Prim 'eq? (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'sete (list (ByteReg 'al)))
+                              (Instr 'sete (list (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '< (list e1 e2)) (list
                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                             (Instr 'setl (list (ByteReg 'al)))
+                             (Instr 'setl (list (Reg 'al)))
                              (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '<= (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'setle (list (ByteReg 'al)))
+                              (Instr 'setle (list (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '> (list e1 e2)) (list
                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                             (Instr 'setg (list (ByteReg 'al)))
+                             (Instr 'setg (list (Reg 'al)))
                              (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '>= (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'setge (list (ByteReg 'al)))
+                              (Instr 'setge (list (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
@@ -276,19 +275,18 @@
 (define (uncover-live-arg e)
   (define (get-parent-reg r)
     (match r
-      [(ByteReg 'al) (Reg 'rax)]
-      [(ByteReg 'ah) (Reg 'rax)]
-      [(ByteReg 'bl) (Reg 'rbx)]
-      [(ByteReg 'bh) (Reg 'rbx)]
-      [(ByteReg 'cl) (Reg 'rcx)]
-      [(ByteReg 'ch) (Reg 'rcx)]
-      [(ByteReg 'dl) (Reg 'rdx)]
-      [(ByteReg 'dh) (Reg 'rdx)]
-      [_ (error "unkown byte reg")]))
+      [(Reg 'al) (Reg 'rax)]
+      [(Reg 'ah) (Reg 'rax)]
+      [(Reg 'bl) (Reg 'rbx)]
+      [(Reg 'bh) (Reg 'rbx)]
+      [(Reg 'cl) (Reg 'rcx)]
+      [(Reg 'ch) (Reg 'rcx)]
+      [(Reg 'dl) (Reg 'rdx)]
+      [(Reg 'dh) (Reg 'rdx)]
+      [_ r]))
   (match e
     [(Var _) (set e)]
-    [(Reg _) (set e)]
-    [(ByteReg _) (set (get-parent-reg e))]
+    [(Reg _) (set (get-parent-reg e))]
     [_ (set)]))
 
 (define (get-write instr)
@@ -516,9 +514,9 @@
                                              (Instr 'movq (list (Reg 'rax) arg2)))]
     [(Instr name (list arg1 arg2))   #:when (and (Deref? arg1) (Deref? arg2))
                                      (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
-    [(Instr 'compq (list arg1 (Imm arg2))) 
+    [(Instr 'cmpq (list arg1 (Imm arg2))) 
                                      (list (Instr 'movq  (list (Imm arg2) (Reg 'rax)))
-                                           (Instr 'compq (list arg1 (Reg 'rax))))]
+                                           (Instr 'cmpq (list arg1 (Reg 'rax))))]
     [_ (list i)]))
 
 ;; assign-homes : pseudo-X86 -> X86
@@ -528,7 +526,7 @@
      (define new-blocks (for/list ([block blocks])
                           (match block
                             [(cons label (Block blkinfo blkbody))
-                             (cons 'start (Block blkinfo (foldr
+                             (cons label (Block blkinfo (foldr
                                                           (lambda (instr old)
                                                             (append (patch-single-instruction instr) old)) '() blkbody)))])))
      (X86Program info new-blocks)]))
