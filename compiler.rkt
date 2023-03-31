@@ -187,9 +187,9 @@
                           (Instr 'movq (list (select-instructions-atm e1) x))
                           (Instr 'negq (list x)))]
     [(Prim 'eq? (list e1 e2)) (list
-                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'set (list 'e (Reg 'al)))
-                              (Instr 'movzbq (list (Reg 'al) x)))]
+                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
+                               (Instr 'set (list 'e (Reg 'al)))
+                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '< (list e1 e2)) (list
                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
                              (Instr 'set (list 'l (Reg 'al)))
@@ -296,7 +296,7 @@
     [(Instr 'movzbq (list _ arg2))  (set-union (uncover-live-arg arg2))]
     [(Instr 'negq (list arg1))      (set-union (uncover-live-arg arg1))]
     [(Instr 'xorq (list _ arg2))    (set-union (uncover-live-arg arg2))]
-    [(Instr 'set (list cc arg2))    (set-union (uncover-live-arg arg2))]
+    [(Instr 'set (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Callq _ _) (list->set caller-saved-list)]
     [_ (set)]))
 
@@ -316,7 +316,7 @@
     [(Jmp label) (define jmp-after (dict-ref label->live label))
                  (cons (set-union jmp-after (car previ)) previ)]
     [(JmpIf _ label) (define jmp-after (dict-ref label->live label))
-                 (cons (set-union jmp-after (car previ)) previ)]
+                     (cons (set-union jmp-after (car previ)) previ)]
     [_ (define r (get-read newi))
        (define w (get-write newi))
        (cons (set-union (set-subtract (car previ) w) r) previ)]))
@@ -380,7 +380,7 @@
            [(cons _ (Block blkinfo blkbody))
             (define live-after-sets (dict-ref blkinfo 'live-after))
             (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
-     (graph-union! graph interference-graph))
+       (graph-union! graph interference-graph))
      (X86Program (dict-set info 'conflicts graph) blocks)]))
 
 
@@ -501,8 +501,8 @@
                           (match block
                             [(cons label (Block blkinfo blkbody))
                              (cons label (Block blkinfo (foldr (lambda (instr result)
-                                                                  (allocate-registers-instr instr result var->location))
-                                                                '() blkbody)))])))
+                                                                 (allocate-registers-instr instr result var->location))
+                                                               '() blkbody)))])))
      (X86Program (dict-set* info 'stack-space stack-space 'used-callee used-callee) new-blocks)]))
 
 
@@ -516,8 +516,8 @@
     [(Instr name (list arg1 arg2))   #:when (and (Deref? arg1) (Deref? arg2))
                                      (list (Instr 'movq (list arg1 (Reg 'rax))) (Instr name (list (Reg 'rax) arg2)))]
     [(Instr 'cmpq (list arg1 (Imm arg2))) 
-                                     (list (Instr 'movq  (list (Imm arg2) (Reg 'rax)))
-                                           (Instr 'cmpq (list arg1 (Reg 'rax))))]
+     (list (Instr 'movq  (list (Imm arg2) (Reg 'rax)))
+           (Instr 'cmpq (list arg1 (Reg 'rax))))]
     [_ (list i)]))
 
 ;; assign-homes : pseudo-X86 -> X86
@@ -528,8 +528,8 @@
                           (match block
                             [(cons label (Block blkinfo blkbody))
                              (cons label (Block blkinfo (foldr
-                                                          (lambda (instr old)
-                                                            (append (patch-single-instruction instr) old)) '() blkbody)))])))
+                                                         (lambda (instr old)
+                                                           (append (patch-single-instruction instr) old)) '() blkbody)))])))
      (X86Program info new-blocks)]))
 
 
