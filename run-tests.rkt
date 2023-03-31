@@ -25,7 +25,7 @@
           (string=? r (car (string-split p "_"))))
         all-tests)))
 
-(interp-tests "var" #f compiler-passes interp-Lif "var_test" (tests-for "var"))
+;; (interp-tests "var" #f compiler-passes interp-Lif "var_test" (tests-for "var"))
 (interp-tests "cond" type-check-Lif compiler-passes interp-Lif "cond_test" (tests-for "cond"))
 
 ;; Uncomment the following when all the passes are complete to

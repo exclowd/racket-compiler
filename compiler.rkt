@@ -145,7 +145,7 @@
      (define thn-block (explicate-pred thn^ thn els))
      (define els-block (explicate-pred els^ thn els))
      (explicate-pred cnd^ thn-block els-block)]
-    [else (error "explicate_pred unhandled case" cnd)]))
+    [_ (error "explicate_pred unhandled case" cnd)]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
@@ -188,23 +188,23 @@
                           (Instr 'negq (list x)))]
     [(Prim 'eq? (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'sete (list (Reg 'al)))
+                              (Instr 'set (list 'e (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '< (list e1 e2)) (list
                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                             (Instr 'setl (list (Reg 'al)))
+                             (Instr 'set (list 'l (Reg 'al)))
                              (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '<= (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'setle (list (Reg 'al)))
+                              (Instr 'set (list 'le (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '> (list e1 e2)) (list
                              (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                             (Instr 'setg (list (Reg 'al)))
+                             (Instr 'set (list 'g (Reg 'al)))
                              (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim '>= (list e1 e2)) (list
                               (Instr 'cmpq (list (select-instructions-atm e2) (select-instructions-atm e1)))
-                              (Instr 'setge (list (Reg 'al)))
+                              (Instr 'set (list 'ge (Reg 'al)))
                               (Instr 'movzbq (list (Reg 'al) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e1 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
     [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
@@ -473,6 +473,7 @@
 
 (define (allocate-registers-instr instr result var->location)
   (match instr
+    [(Instr 'set (list cc arg)) (cons (Instr 'set (list cc (allocate-registers-imm arg var->location))) result)]
     [(Instr name (list arg))        (cons (Instr name (list (allocate-registers-imm arg  var->location))) result)]
     [(Instr name (list arg1 arg2))  (cons (Instr name (list (allocate-registers-imm arg1 var->location)
                                                             (allocate-registers-imm arg2 var->location))) result)]
