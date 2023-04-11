@@ -436,12 +436,6 @@
                      (cons (set-union jmp-after (car previ)) previ)]
     [_ (define r (get-read newi))
        (define w (get-write newi))
-       (print "For instruction")
-       (println newi)
-       (print "read set")
-       (println r)
-       (println "write set")
-       (println w)
        (cons (set-union (set-subtract (car previ) w) r) previ)]))
 
 (define (uncover-live-block b label->live)
@@ -462,7 +456,6 @@
                                   (match block
                                     [(cons label (Block blkinfo blkbody))
                                      (for ([instr blkbody])
-                                       (println instr)
                                        (match instr
                                          [(Jmp dest)  #:when (eq? dest conc-label) (void)]
                                          [(JmpIf _ dest) #:when (eq? dest conc-label) (void)]
@@ -476,8 +469,6 @@
                           (match (dict-ref blocks label)
                             [(Block blkinfo blkbody)
                              (define blk-live-after (uncover-live-block (Block blkinfo blkbody) label->live))
-                             (print "Block live after")
-                             (println blk-live-after)
                              (set! label->live (dict-set label->live label (car blk-live-after)))
                              (cons label (Block (dict-set blkinfo 'live-after blk-live-after) blkbody))])))
      (Def name param* rty (dict-set info 'label->live label->live) new-blocks)]))
@@ -696,8 +687,10 @@
                             (Instr 'pushq (list (Reg 'rbp)))
                             (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
                            (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                           (if  (> (dict-ref info 'stack-space) 0)
+                                (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                '())
                            (list
-                            (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
                             (Jmp start-label)))))))
 
 
@@ -705,8 +698,9 @@
   (define conc-label  (string->symbol (~a name 'conclusion)))
   (list (cons conc-label (Block '()
                                 (append
-                                 (list
-                                  (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                 (if (> (dict-ref info 'stack-space) 0)
+                                     (list (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                     '())
                                  (foldr (lambda (r res) (cons (Instr 'popq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
                                  (list
                                   (Instr 'popq (list (Reg 'rbp)))
@@ -715,7 +709,23 @@
 (define (prelude-and-conclusion-function p)
   (match p
     [(Def name param* rty info blocks)
-     (append (generate-prelude name info) blocks (generate-conclusion name info))]))
+     ;; fix Tail jump
+     (define (replace-tailjump instr)
+       (match instr
+         [(TailJmp target arity) (append
+                                  (if (> (dict-ref info 'stack-space) 0)
+                                      (list (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                      '())
+                                  (foldr (lambda (r res) (cons (Instr 'popq (list r)) res)) '() (set->list (dict-ref info 'used-callee)))
+                                  (list
+                                   (Instr 'popq (list (Reg 'rbp)))
+                                   (IndirectJmp target)))]
+         [_ (list instr)]))
+     (define new-blocks (for/list ([blk blocks])
+                          (match blk
+                            [(cons label (Block info instr*))
+                             (cons label (Block info (foldr (lambda (instr accum) (append (replace-tailjump instr) accum)) '() instr*)))])))
+     (append (generate-prelude name info) new-blocks (generate-conclusion name info))]))
 
 
 ;; prelude-and-conclusion : X86 -> X86
