@@ -2,8 +2,8 @@
 #lang racket
 
 (require "utilities.rkt")
-(require "type-check-Lif.rkt")
-(require "interp-Lif.rkt")
+(require "type-check-Lfun.rkt")
+(require "interp-Lfun.rkt")
 (require "interp.rkt")
 (require "compiler.rkt")
 (require "graph-printing.rkt")
@@ -26,7 +26,7 @@
         all-tests)))
 
 ;; (interp-tests "var" #f compiler-passes interp-Lif "var_test" (tests-for "var"))
-(interp-tests "cond" type-check-Lif compiler-passes interp-Lif "cond_test" (tests-for "cond"))
+(interp-tests "cond" type-check-Lfun compiler-passes interp-Lfun "functions_test" (tests-for "functions"))
 
 ;; Uncomment the following when all the passes are complete to
 ;; test the final x86 code.

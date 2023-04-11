@@ -16,7 +16,7 @@
     (define/override (free-vars-exp e)
       (define (recur e) (send this free-vars-exp e))
       (match e
-        [(AllocateHom e-len ty) (recur e-len)]
+        [(AllocateArray e-len ty) (recur e-len)]
 	[else (super free-vars-exp e)]))
 
     ))

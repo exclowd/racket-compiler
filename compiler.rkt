@@ -3,11 +3,12 @@
 (require racket/fixnum)
 (require graph)
 (require "interp-Lint.rkt")
-(require "interp-Lif.rkt")
-(require "interp-Cif.rkt")
+(require "interp-Lfun.rkt")
+(require "interp-Lfun-prime.rkt")
+(require "interp-Cfun.rkt")
 (require "interp.rkt")
-(require "type-check-Lif.rkt")
-(require "type-check-Cif.rkt")
+(require "type-check-Lfun.rkt")
+(require "type-check-Cfun.rkt")
 (require "utilities.rkt")
 (require "multigraph.rkt")
 (require "graph-printing.rkt")
@@ -26,14 +27,20 @@
     [(Prim 'or `(,e1 ,e2))  (let ([e1 (shrink-exp e1)]
                                   [e2 (shrink-exp e2)])
                               (If e1 (Bool #t) e2))]
-    [(Prim op es) (Prim op (for/list ([ex es]) (shrink-exp ex)))]
+    [(Prim op es) (Prim op (map shrink-exp es))]
     [(If c t e) (If (shrink-exp c) (shrink-exp t) (shrink-exp e))]
-    [_ (error "Unrecognized expression (shrink_exp)")])
+    [(Apply f a*) (Apply f (map shrink-exp a*))]
+    [_ (error "Unrecognized expression (shrink-exp)")])
   )
 
 (define (shrink p)
   (match p
-    [(Program info e) (Program info (shrink-exp e))]))
+    [(ProgramDefsExp info fn-list e)
+     (define maindef (list (Def 'main '() 'Integer '() (shrink-exp e))))
+     (define fndefs (for/list ([fn fn-list])
+                      (match fn
+                        [(Def name param* rty info body) (Def name param* rty info (shrink-exp body))])))
+     (ProgramDefs info (append fndefs maindef))]))
 
 
 (define (uniquify-exp env)
@@ -47,14 +54,56 @@
                                ((uniquify-exp env) rhs)
                                ((uniquify-exp env-new) body)))]
       [(Prim op es)
-       (Prim op (for/list ([e es]) ((uniquify-exp env) e)))]
+       (Prim op (map (uniquify-exp env) es))]
       [(If cnd thn els) (If ((uniquify-exp env) cnd) ((uniquify-exp env) thn) ((uniquify-exp env) els))]
+      [(Apply fun arg*) (Apply ((uniquify-exp env) fun) (map (uniquify-exp env) arg*))]
       [_ (error "Unrecognized expression (uniquify_exp)")])))
 
 ;; uniquify : R1 -> R1
 (define (uniquify p)
   (match p
-    [(Program '() e) (Program '() ((uniquify-exp '()) e))]))
+    [(ProgramDefs info functions)
+     (define fn-env (for/list ([fn functions])
+                      (match fn
+                        [(Def name param* rty '() body)
+                         (cons name name)])))
+     (ProgramDefs info (for/list ([fn functions])
+                         (match fn
+                           [(Def name param* rty info body)
+                            (define param-env (for/list ([param param*]) (match param [(list name : T) (cons name name)])))
+                            (Def name param* rty info ((uniquify-exp (append param-env fn-env)) body))])))]))
+
+
+(define (reveal-functions-exp fn->arity e)
+  (match e
+    [(Var x) (Var x)]
+    [(Int n) (Int n)]
+    [(Bool b) (Bool b)]
+    [(Let x rhs body) (Let x
+                           (reveal-functions-exp fn->arity rhs)
+                           (reveal-functions-exp fn->arity body))]
+    [(Prim op e*) (Prim op (for/list ([e e*]) (reveal-functions-exp fn->arity e)))]
+    [(If c t e) (If
+                 (reveal-functions-exp fn->arity c)
+                 (reveal-functions-exp fn->arity t)
+                 (reveal-functions-exp fn->arity e))]
+    [(Apply f a*) (Apply (match f
+                           [(Var x) (FunRef x (dict-ref fn->arity x))])
+                         (for/list [(a a*)] (reveal-functions-exp fn->arity a)))]
+    [_ (error "Unrecognized expression (reveal_functions_exp)")]))
+
+;; reveal_functions Lfun : Lfun Ref
+(define (reveal-functions p)
+  (match p
+    [(ProgramDefs info functions)
+     (define fn->arity (for/list ([fn functions])
+                         (match fn
+                           [(Def name param* rty '() body)
+                            (cons name (length param*))])))
+     (ProgramDefs info (for/list ([fn functions])
+                         (match fn
+                           [(Def name param* rty '() body)
+                            (Def name param* rty '() (reveal-functions-exp fn->arity body))])))]))
 
 
 (define (rco-atom e)
@@ -67,12 +116,20 @@
      (define-values (body_atm body_env) (rco-atom body))
      (values body_atm (append (list (cons x rhs_exp)) body_env))]
     [(Prim op es)
-     (define tmp (gensym "tmp"))
+     (define tmp (gensym "tmp-op"))
      (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
      (values (Var tmp) (append (append* env_new) (list (cons tmp (Prim op es_new)))))]
     [(If cnd thn els)
-     (define tmp (gensym "tmp"))
+     (define tmp (gensym "tmp-if"))
      (values (Var tmp) (list (cons tmp (rco-exp (If (rco-exp cnd) (rco-exp thn) (rco-exp els))))))]
+    [(FunRef name arity)
+     (define tmp (gensym "tmp-funref"))
+     (values (Var tmp) (list (cons tmp (rco-exp (FunRef name arity)))))]
+    [(Apply fun arg*)
+     (define tmp (gensym "tmp-fun"))
+     (define-values (f_atm f_env) (rco-atom fun))
+     (define-values (args_atm env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
+     (values (Var tmp) (append f_env (append* env_new) (list (cons tmp (Apply f_atm args_atm)))))]
     [_ (error "Unrecognized expression (rco-atom)")]))
 
 (define (rco-exp e)
@@ -90,19 +147,28 @@
      (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
      (env-to-let (append* env_new) (Prim op es_new))]
     [(If cnd thn els) (If (rco-exp cnd) (rco-exp thn) (rco-exp els))]
+    [(FunRef name arity) (FunRef name arity)]
+    [(Apply fun arg*)
+     (define-values (f_atm f_env) (rco-atom fun))
+     (define-values (args_atm env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
+     (env-to-let (append f_env (append* env_new)) (Apply f_atm args_atm))]
     [_ (error "Unrecognized expression (rco-exp)")]))
 
 ;; remove-complex-opera* : R1 -> R1
 (define (remove-complex-opera* p)
   (match p
-    [(Program info e) (Program info (rco-exp e))]))
+    [(ProgramDefs info functions)
+     (ProgramDefs info (for/list ([fn functions])
+                         (match fn
+                           [(Def name param* rty '() body)
+                            (Def name param* rty '() (rco-exp body))])))]))
 
 (define basic-blocks (make-hash))
 
 (define (create-block tail)
   (match tail
     [(Goto label) (Goto label)]
-    [else
+    [_
      (let ([label (gensym 'block)])
        (dict-set! basic-blocks label tail)
        (Goto label))]))
@@ -118,6 +184,8 @@
      (define thn-block (create-block (explicate-tail thn)))
      (define els-block (create-block (explicate-tail els)))
      (explicate-pred cnd thn-block els-block)]
+    [(Apply fun args*) (TailCall fun args*)]
+    [(FunRef name arity) (Return (FunRef name arity))]
     [_ (error "Unrecognized expression (explicate-tail)" e)]))
 
 (define (explicate-assign e x cont)
@@ -131,6 +199,8 @@
      (define thn-block (explicate-assign thn x cont))
      (define els-block (explicate-assign els x cont))
      (explicate-pred cnd thn-block els-block)]
+    [(Apply fun args*) (Seq (Assign (Var x) (Call fun args*)) cont)]
+    [(FunRef name arity) (Seq (Assign (Var x) (FunRef name arity)) cont)]
     [_ (error "Unrecognized expression (explicate-assign)" e)]))
 
 (define (explicate-pred cnd thn els)
@@ -145,15 +215,23 @@
      (define thn-block (explicate-pred thn^ thn els))
      (define els-block (explicate-pred els^ thn els))
      (explicate-pred cnd^ thn-block els-block)]
-    [_ (error "explicate_pred unhandled case" cnd)]))
+    [(Apply fun args*)
+     (IfStmt (Call fun args*) (create-block thn) (create-block els))]
+    [_ (error "Unrecognized expression (explicate-pred)" cnd thn els)]))
+
+(define (explicate-control-function p)
+  (match p
+    [(Def name param* rty '() body)
+     (set! basic-blocks (make-hash))
+     (define start-label (string->symbol (~a name 'start)))
+     (println start-label)
+     (dict-set! basic-blocks start-label (explicate-tail body))
+     (Def name param* rty '() (hash->list basic-blocks))]))
 
 ;; explicate-control : R1 -> C0
 (define (explicate-control p)
   (match p
-    [(Program info body)
-     (set! basic-blocks (make-hash))
-     (dict-set! basic-blocks 'start (explicate-tail body))
-     (CProgram info (hash->list basic-blocks))]))
+    [(ProgramDefs info fun*) (ProgramDefs info (for/list ([fun fun*]) (explicate-control-function fun)))]))
 
 
 (define (select-instructions-atm atm)
@@ -567,15 +645,16 @@
 (define compiler-passes
   `(
     ;; Uncomment the following passes as you finish them.
-    ("shrink" ,shrink ,interp-Lif ,type-check-Lif)
-    ("uniquify" ,uniquify ,interp-Lif ,type-check-Lif)
-    ("remove complex opera*" ,remove-complex-opera* ,interp-Lif ,type-check-Lif)
-    ("explicate control" ,explicate-control ,interp-Cif ,type-check-Cif)
-    ("instruction selection", select-instructions ,interp-pseudo-x86-1)
-    ("uncover live", uncover-live ,interp-pseudo-x86-1)
-    ("build interference", build-interference ,interp-pseudo-x86-1)
-    ; ("assign homes", assign-homes ,interp-x86-0)
-    ("allocate registers", allocate-registers ,interp-x86-1)
-    ("patch instructions", patch-instructions ,interp-x86-1)
-    ("prelude and conclusion", prelude-and-conclusion ,interp-x86-1)
+    ("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
+    ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
+    ("reveal functions" ,reveal-functions ,interp-Lfun-prime , type-check-Lfun)
+    ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
+    ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
+    ;; ("instruction selection", select-instructions ,interp-pseudo-x86-1)
+    ;; ("uncover live", uncover-live ,interp-pseudo-x86-1)
+    ;; ("build interference", build-interference ,interp-pseudo-x86-1)
+    ;; ("assign homes", assign-homes ,interp-x86-0)
+    ;; ("allocate registers", allocate-registers ,interp-x86-1)
+    ;; ("patch instructions", patch-instructions ,interp-x86-1)
+    ;; ("prelude and conclusion", prelude-and-conclusion ,interp-x86-1)
     ))
