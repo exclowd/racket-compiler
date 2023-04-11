@@ -66,17 +66,21 @@
      (define fn-env (for/list ([fn functions])
                       (match fn
                         [(Def name param* rty '() body)
-                         (cons name name)])))
+                         (define uniq-name (if (eq? name 'main) name (gensym name)))
+                         (cons name uniq-name)])))
      (ProgramDefs info (for/list ([fn functions])
                          (match fn
                            [(Def name param* rty info body)
-                            (define param-env (for/list ([param param*]) (match param [(list name : T) (cons name name)])))
-                            (Def name param* rty info ((uniquify-exp (append param-env fn-env)) body))])))]))
+                            (define param-env (for/list ([param param*])
+                                                (match param [(list name : T) (cons name (gensym name))])))
+                            (define new-param* (for/list ([param param*])
+                                                 (match param [(list name : T) (list (dict-ref param-env name) : T)])))
+                            (Def (dict-ref fn-env name) new-param* rty info ((uniquify-exp (append param-env fn-env)) body))])))]))
 
 
 (define (reveal-functions-exp fn->arity e)
   (match e
-    [(Var x) (Var x)]
+    [(Var x) (if (dict-has-key? fn->arity x) (FunRef x (dict-ref fn->arity x)) (Var x))]
     [(Int n) (Int n)]
     [(Bool b) (Bool b)]
     [(Let x rhs body) (Let x
@@ -87,9 +91,7 @@
                  (reveal-functions-exp fn->arity c)
                  (reveal-functions-exp fn->arity t)
                  (reveal-functions-exp fn->arity e))]
-    [(Apply f a*) (Apply (match f
-                           [(Var x) (FunRef x (dict-ref fn->arity x))])
-                         (for/list [(a a*)] (reveal-functions-exp fn->arity a)))]
+    [(Apply f a*) (Apply (reveal-functions-exp fn->arity f) (for/list [(a a*)] (reveal-functions-exp fn->arity a)))]
     [_ (error "Unrecognized expression (reveal_functions_exp)")]))
 
 ;; reveal_functions Lfun : Lfun Ref
@@ -251,6 +253,11 @@
       [(Prim '- (list _ _)) 'subq]))
   (match e
     [atm #:when (atm? atm) (list (Instr 'movq (list (select-instructions-atm atm) x)))]
+    [(FunRef fun _) (list (Instr 'leaq (list (Global fun) x)))]
+    [(Call fun arg*)
+     (define arg-moves (for/list ([reg (take arguments-list (length arg*))][arg arg*])
+                         (Instr 'movq (list (select-instructions-atm arg) reg))))
+     (append arg-moves (list (IndirectCallq fun (length arg*)) (Instr 'movq (list (Reg 'rax) x))))]
     [(Prim 'not (list e1)) #:when (equal? e1 x)
                            (list
                             (Instr 'xorq (list (Imm 1) (select-instructions-atm e1))))]
@@ -288,18 +295,23 @@
     [(Prim _ (list e1 e2)) #:when (equal? e2 x) (list (Instr (get-op-instruction e) (list (select-instructions-atm e1) x)))]
     [(Prim _ (list e1 e2)) (list
                             (Instr 'movq                  (list (select-instructions-atm e1) x))
-                            (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]))
+                            (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
+    [_ (error "unrecognized expression (select-assign)" e)]
+    ))
 
 (define (select-instructions-stmt stmt)
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
-    [(Assign lhs rhs) (select-assign lhs rhs)]))
+    [(Assign lhs rhs) (select-assign lhs rhs)]
+    [_ (error "unrecognized expression (select-instructions-stmt)" stmt)]
+    ))
 
-(define (select-instructions-tail e)
+(define (select-instructions-tail e jmp-label)
   (match e
-    [(Seq fst snd) (append (select-instructions-stmt fst) (select-instructions-tail snd))]
-    [(Return (Prim 'read '())) (list (Callq 'read_int 1) (Jmp 'conclusion))]
-    [(Return _) (append (select-instructions-stmt e) (list (Jmp 'conclusion)))]
+    [(Seq fst snd) (append (select-instructions-stmt fst) (select-instructions-tail snd jmp-label))]
+    [(Return (Prim 'read '())) (list (Callq 'read_int 1) (Jmp jmp-label))]
+    [(Return (FunRef fun arity)) (list (Instr 'leaq (list (Global fun) (Reg 'rax))))]
+    [(Return _) (append (select-instructions-stmt e) (list (Jmp jmp-label)))]
     [(Goto l) (list (Jmp l))]
     [(IfStmt (Prim 'eq? (list arg1 arg2)) (Goto label1) (Goto label2))
      (define arg1^ (select-instructions-atm arg1))
@@ -335,20 +347,43 @@
      (list
       (Instr 'cmpq (list arg2^ arg1^))
       (JmpIf 'ge label1)
-      (Jmp label2))]))
+      (Jmp label2))]
+    [(TailCall fun arg*)
+     (define arg-moves (for/list ([reg (take arguments-list (length arg*))][arg arg*])
+                         (Instr 'movq (list (select-instructions-atm arg) reg))))
+     (append arg-moves (list (TailJmp fun (length arg*))))]
+    [_ (error "unrecognized expression (select-instructions-tail)" e)]
+    ))
+
+
+(define (select-instructions-function p)
+  (match p
+    [(Def name param* rty info blocks)
+     (define num-params (length param*))
+     (define arg-moves (for/list ([reg (take arguments-list num-params)][param param*])
+                         (Instr 'movq (list reg (Var (car param))))))
+     (define start-label (string->symbol (~a name 'start)))
+     (define conc-label  (string->symbol (~a name 'conclusion)))
+     (define new-blocks (for/list ([block blocks]) (cons (car block) (Block '() (select-instructions-tail (cdr block) conc-label)))))
+     (define new-start-block
+               (match (dict-ref new-blocks start-label)
+                 [(Block '() instr*)
+                  (Block '() (append arg-moves instr*))]))
+     (set! new-blocks (dict-set new-blocks start-label new-start-block))
+     (Def name '() rty (dict-set info 'num-params  num-params) new-blocks)]))
 
 ;; select-instructions : C0 -> pseudo-X86
 (define (select-instructions p)
   (match p
-    [(CProgram info blocks)
-     (println (first blocks))
-     (define new-blocks (for/list ([block blocks]) (cons (car block) (Block '() (select-instructions-tail (cdr block))))))
-     (X86Program info new-blocks)]))
+    [(ProgramDefs info functions)
+     (ProgramDefs info (for/list ([fn functions]) (select-instructions-function fn)))]))
 
 
 (define caller-saved-list (list (Reg 'rax) (Reg 'rcx) (Reg 'rdx) (Reg 'rsi) (Reg 'rdi) (Reg 'r8) (Reg 'r9) (Reg 'r10) (Reg 'r11)))
 
 (define callee-saved-list (list (Reg 'rsp) (Reg 'rbp) (Reg 'rbx) (Reg 'r12) (Reg 'r13) (Reg 'r14) (Reg 'r15)))
+
+(define arguments-list    (list (Reg 'rdi) (Reg 'rsi) (Reg 'rdx) (Reg 'rcx) (Reg 'r8) (Reg 'r9)))
 
 (define (uncover-live-arg e)
   (define (get-parent-reg r)
@@ -376,6 +411,8 @@
     [(Instr 'xorq (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Instr 'set (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Callq _ _) (list->set caller-saved-list)]
+    [(IndirectCallq _ _) (list->set caller-saved-list)]
+    [(TailCall _ _) (list->set caller-saved-list)]
     [_ (set)]))
 
 (define (get-read instr)
@@ -386,7 +423,9 @@
     [(Instr 'negq (list arg))       (set-union (uncover-live-arg arg))]
     [(Instr 'xorq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
     [(Instr 'cmpq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
-    [(Callq _ arity) (list->set (take callee-saved-list arity))]
+    [(Callq _ arity) (list->set (take arguments-list arity))]
+    [(IndirectCallq arg arity) (set-union (set arg) (list->set (take arguments-list arity)))]
+    [(TailCall arg arity)      (set-union (set arg) (list->set (take arguments-list arity)))]
     [_ (set)]))
 
 (define (uncover-live-instr newi previ label->live)
@@ -405,11 +444,11 @@
      (define live-after-sets (foldr (lambda (v l) (uncover-live-instr v l label->live)) (list (set)) blkbody))
      live-after-sets]))
 
-;; uncover-live : pseudo-X86 -> pseudo-X86
-(define (uncover-live p)
+(define (uncover-live-function p)
   (match p
-    [(X86Program info blocks)
-     (define label->live (list(cons 'conclusion (set (Reg 'rax) (Reg 'rsp)))))
+    [(Def name param* rty info blocks)
+     (define conc-label  (string->symbol (~a name 'conclusion)))
+     (define label->live (list(cons conc-label (set (Reg 'rax) (Reg 'rsp)))))
      (define labels (dict-keys blocks))
      (define cfg (make-multigraph '()))
      (for/list ([label labels]) (add-vertex! cfg label))
@@ -417,9 +456,10 @@
                                   (match block
                                     [(cons label (Block blkinfo blkbody))
                                      (for ([instr blkbody])
+                                       (println instr)
                                        (match instr
-                                         [(Jmp 'conclusion) (void)]
-                                         [(JmpIf _ 'conclusion) (void)]
+                                         [(Jmp dest)  #:when (eq? dest conc-label) (void)]
+                                         [(JmpIf _ dest) #:when (eq? dest conc-label) (void)]
                                          [(Jmp dest) (add-directed-edge! graph label dest)]
                                          [(JmpIf _ dest) (add-directed-edge! graph label dest)]
                                          [_ (void)]))])
@@ -432,7 +472,12 @@
                              (define blk-live-after (uncover-live-block (Block blkinfo blkbody) label->live))
                              (set! label->live (dict-set label->live label (car blk-live-after)))
                              (cons label (Block (dict-set blkinfo 'live-after blk-live-after) blkbody))])))
-     (X86Program (dict-set info 'label->live label->live) new-blocks)]))
+     (Def name param* rty (dict-set info 'label->live label->live) new-blocks)]))
+
+;; uncover-live : pseudo-X86 -> pseudo-X86
+(define (uncover-live p)
+  (match p
+    [(ProgramDefs info functions) (ProgramDefs info (map uncover-live-function functions))]))
 
 
 (define (build-interference-graph instr live-after graph)
@@ -650,11 +695,11 @@
     ("reveal functions" ,reveal-functions ,interp-Lfun-prime , type-check-Lfun)
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
     ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
-    ;; ("instruction selection", select-instructions ,interp-pseudo-x86-1)
-    ;; ("uncover live", uncover-live ,interp-pseudo-x86-1)
-    ;; ("build interference", build-interference ,interp-pseudo-x86-1)
+    ("instruction selection", select-instructions ,interp-pseudo-x86-3)
+    ("uncover live", uncover-live ,interp-pseudo-x86-3)
+    ;; ("build interference", build-interference ,interp-pseudo-x86-3)
     ;; ("assign homes", assign-homes ,interp-x86-0)
-    ;; ("allocate registers", allocate-registers ,interp-x86-1)
-    ;; ("patch instructions", patch-instructions ,interp-x86-1)
-    ;; ("prelude and conclusion", prelude-and-conclusion ,interp-x86-1)
+    ;;    ("allocate registers", allocate-registers ,interp-x86-3)
+    ;;    ("patch instructions", patch-instructions ,interp-x86-3)
+    ;;    ("prelude and conclusion", prelude-and-conclusion ,interp-x86-3)
     ))

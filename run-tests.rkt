@@ -26,7 +26,7 @@
         all-tests)))
 
 ;; (interp-tests "var" #f compiler-passes interp-Lif "var_test" (tests-for "var"))
-(interp-tests "cond" type-check-Lfun compiler-passes interp-Lfun "functions_test" (tests-for "functions"))
+(interp-tests "function" type-check-Lfun compiler-passes interp-Lfun "functions_test" (tests-for "functions"))
 
 ;; Uncomment the following when all the passes are complete to
 ;; test the final x86 code.

@@ -1,7 +1,10 @@
 (define (map [f : (Integer -> Integer)]) : Integer
-    42)
+    (f 42))
 
 (define (inc [x : Integer]) : Integer
     (+ x 1))
 
-(map inc)
+(define (ret-inc [x : Integer]) : (Integer -> Integer)
+  inc)
+
+(map (ret-inc 11))
