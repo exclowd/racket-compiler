@@ -15,24 +15,29 @@
 (require "priority_queue.rkt")
 (provide (all-defined-out))
 
+
 (define (shrink-exp e)
   (match e
+    [(Void) (Void)]
     [(Var x) (Var x)]
     [(Int n) (Int n)]
     [(Bool b) (Bool b)]
-    [(Let x rhs body) (Let x (shrink-exp rhs) (shrink-exp body))]
-    [(Prim 'and `(,e1 ,e2)) (let ([e1 (shrink-exp e1)]
-                                  [e2 (shrink-exp e2)])
-                              (If e1 e2 (Bool #f)))]
-    [(Prim 'or `(,e1 ,e2))  (let ([e1 (shrink-exp e1)]
-                                  [e2 (shrink-exp e2)])
-                              (If e1 (Bool #t) e2))]
-    [(Prim op es) (Prim op (map shrink-exp es))]
-    [(If c t e) (If (shrink-exp c) (shrink-exp t) (shrink-exp e))]
-    [(Apply f a*) (Apply f (map shrink-exp a*))]
-    [_ (error "Unrecognized expression (shrink-exp)")])
-  )
+    [(Let var rhs body) (Let var (shrink-exp rhs) (shrink-exp body))]
+    [(HasType expr type) (HasType (shrink-exp expr) type)]
+    [(Prim 'and (list arg1 arg2)) (let ([e1 (shrink-exp arg1)]
+                                        [e2 (shrink-exp arg2)])
+                                    (If arg1 arg2 (Bool #f)))]
+    [(Prim 'or (list arg1 arg2))  (let ([e1 (shrink-exp arg1)]
+                                        [e2 (shrink-exp arg2)])
+                                    (If arg1 (Bool #t) arg2))]
+    [(Prim 'vector-ref  (list vec (Int i)))     (Prim 'vector-ref  (list (shrink-exp vec) (Int i)))]
+    [(Prim 'vector-set! (list vec (Int i) val)) (Prim 'vector-set! (list (shrink-exp vec) (Int i) (shrink-exp val)))]
+    [(Prim op arg*) (Prim op (map shrink-exp arg*))]
+    [(If cnd thn els) (If (shrink-exp cnd) (shrink-exp thn) (shrink-exp els))]
+    [(Apply fun arg*) (Apply fun (map shrink-exp arg*))]
+    [_ (error "Unrecognized expression (shrink-exp)" e)]))
 
+;; shrink : Lfun -> Lfun
 (define (shrink p)
   (match p
     [(ProgramDefsExp info fn-list e)
@@ -49,17 +54,17 @@
       [(Var x) (Var (dict-ref env x))]
       [(Int n) (Int n)]
       [(Bool b) (Bool b)]
-      [(Let x rhs body) (let ([env-new (dict-set env x (gensym x))])
-                          (Let (dict-ref env-new x)
-                               ((uniquify-exp env) rhs)
-                               ((uniquify-exp env-new) body)))]
-      [(Prim op es)
-       (Prim op (map (uniquify-exp env) es))]
+      [(Let var rhs body) (let ([env-new (dict-set env var (gensym var))])
+                            (Let (dict-ref env-new var)
+                                 ((uniquify-exp env) rhs)
+                                 ((uniquify-exp env-new) body)))]
+      [(Prim op arg*) (Prim op (map (uniquify-exp env) arg*))]
+      [(HasType expr type) (HasType ((uniquify-exp env) expr) type)]
       [(If cnd thn els) (If ((uniquify-exp env) cnd) ((uniquify-exp env) thn) ((uniquify-exp env) els))]
       [(Apply fun arg*) (Apply ((uniquify-exp env) fun) (map (uniquify-exp env) arg*))]
-      [_ (error "Unrecognized expression (uniquify_exp)")])))
+      [_ (error "Unrecognized expression (uniquify_exp)" e)])))
 
-;; uniquify : R1 -> R1
+;; uniquify : Lfun -> Lfun
 (define (uniquify p)
   (match p
     [(ProgramDefs info functions)
@@ -80,21 +85,23 @@
 
 (define (reveal-functions-exp fn->arity e)
   (match e
+    [(Void) (Void)]
     [(Var x) (if (dict-has-key? fn->arity x) (FunRef x (dict-ref fn->arity x)) (Var x))]
     [(Int n) (Int n)]
     [(Bool b) (Bool b)]
-    [(Let x rhs body) (Let x
-                           (reveal-functions-exp fn->arity rhs)
-                           (reveal-functions-exp fn->arity body))]
-    [(Prim op e*) (Prim op (for/list ([e e*]) (reveal-functions-exp fn->arity e)))]
-    [(If c t e) (If
-                 (reveal-functions-exp fn->arity c)
-                 (reveal-functions-exp fn->arity t)
-                 (reveal-functions-exp fn->arity e))]
-    [(Apply f a*) (Apply (reveal-functions-exp fn->arity f) (for/list [(a a*)] (reveal-functions-exp fn->arity a)))]
-    [_ (error "Unrecognized expression (reveal_functions_exp)")]))
+    [(Let var rhs body) (Let var
+                             (reveal-functions-exp fn->arity rhs)
+                             (reveal-functions-exp fn->arity body))]
+    [(Prim op arg*) (Prim op (for/list ([arg arg*]) (reveal-functions-exp fn->arity arg)))]
+    [(If cnd thn els) (If
+                       (reveal-functions-exp fn->arity cnd)
+                       (reveal-functions-exp fn->arity thn)
+                       (reveal-functions-exp fn->arity els))]
+    [(HasType expr type) (HasType (reveal-functions-exp fn->arity expr) type)]
+    [(Apply fun arg*) (Apply (reveal-functions-exp fn->arity fun) (for/list [(arg arg*)] (reveal-functions-exp fn->arity arg)))]
+    [_ (error "Unrecognized expression (reveal_functions_exp)" e)]))
 
-;; reveal_functions Lfun : Lfun Ref
+;; reveal_functions : LFun -> LFunRef
 (define (reveal-functions p)
   (match p
     [(ProgramDefs info functions)
@@ -108,8 +115,65 @@
                             (Def name param* rty '() (reveal-functions-exp fn->arity body))])))]))
 
 
+(define (convert-to-lets assignments body)
+  (match assignments
+    ['() body]
+    [_ (define head (car assignments))
+       (define tail (cdr assignments))
+       (Let (car head) (cdr head) (convert-to-lets tail body))]))
+
+(define (set-vector-vals name arg* idx)
+  (match arg*
+    ['() '()]
+    [_ (define head (car arg*))
+       (define tail (cdr arg*))
+       (cons (cons (gensym 'vector-value) (Prim 'vector-set! (list (Var name) (Int idx) (Var (car head)))))
+             (set-vector-vals name tail (+ idx 1)))]))
+
+(define (expose-allocation-exp e)
+  (match e
+    [(Void) (Void)]
+    [(Var x) (Var x)]
+    [(Int n) (Int n)]
+    [(Bool b) (Bool b)]
+    [(Prim op arg*) (Prim op (map expose-allocation-exp arg*))]
+    [(Let var rhs body) (Let var (expose-allocation-exp rhs) (expose-allocation-exp body))]
+    [(If cnd thn els) (If (expose-allocation-exp cnd)
+                          (expose-allocation-exp thn)
+                          (expose-allocation-exp els))]
+    [(Apply fun arg*) (Apply (expose-allocation-exp fun) (map expose-allocation-exp arg*))]
+    [(HasType (Prim 'vector arg*) type)
+     (define nargs (length arg*))
+     (define vector-arg* (for/list ([arg arg*]) (cons (gensym 'vector-arg) (expose-allocation-exp arg))))
+     (define bytes (* 8 nargs))
+     (define vector-name (gensym 'vector))
+     (define allocation (list (cons (gensym 'ask-for-memory)
+                                    (If (Prim '< (list (Prim '+ (list (GlobalValue 'free_ptr)
+                                                                      (Int (+ 8 bytes))))
+                                                       (GlobalValue 'fromspace_end)))
+                                        (Void)
+                                        (Collect (+ 8 bytes))))
+                              (cons  vector-name (Allocate nargs type))))
+     (define vector-set!* (set-vector-vals vector-name vector-arg* 0))
+     (define assignments (append vector-arg* allocation vector-set!*))
+     (convert-to-lets assignments (Var vector-name))]
+    [_ (error "Unrecognized expression (expose_allocation_exp)" e)]))
+
+
+
+;; expose-allocation : LFunRef -> LAllocFunRef
+(define (expose-allocation p)
+  (match p
+    [(ProgramDefs info functions)
+     (ProgramDefs info (for/list ([fn functions])
+                         (match fn
+                           [(Def name param* rty '() body)
+                            (Def name param* rty '() (expose-allocation-exp body))])))]))
+
+
 (define (rco-atom e)
   (match e
+    [(Void) (values (Void) '())]
     [(Var x) (values (Var x) '())]
     [(Int n) (values (Int n) '())]
     [(Bool b) (values (Bool b) '())]
@@ -117,9 +181,9 @@
      (define rhs_exp (rco-exp rhs))
      (define-values (body_atm body_env) (rco-atom body))
      (values body_atm (append (list (cons x rhs_exp)) body_env))]
-    [(Prim op es)
+    [(Prim op arg*)
      (define tmp (gensym "tmp-op"))
-     (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
+     (define-values (es_new env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
      (values (Var tmp) (append (append* env_new) (list (cons tmp (Prim op es_new)))))]
     [(If cnd thn els)
      (define tmp (gensym "tmp-if"))
@@ -132,21 +196,31 @@
      (define-values (f_atm f_env) (rco-atom fun))
      (define-values (args_atm env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
      (values (Var tmp) (append f_env (append* env_new) (list (cons tmp (Apply f_atm args_atm)))))]
-    [_ (error "Unrecognized expression (rco-atom)")]))
+    [(Collect bytes)
+     (define tmp (gensym "tmp-collect"))
+     (values (Var tmp) (list (cons tmp (Collect bytes))))]
+    [(Allocate bytes t)
+     (define tmp (gensym "tmp-allocate"))
+     (values (Var tmp) (list (cons tmp (Allocate bytes t))))]
+    [(GlobalValue x)
+     (define tmp (gensym "tmp-globalvalue"))
+     (values (Var tmp) (list (cons tmp (GlobalValue x))))]
+    [_ (error "Unrecognized expression (rco-atom)" e)]))
 
 (define (rco-exp e)
-  (define (env-to-let env e)
+  (define (env-to-let env body)
     (match env
-      ['() e]
-      [(list (cons x rhs) rest ...) (Let x rhs (env-to-let rest e))]))
+      ['() body]
+      [(list (cons x rhs) rest ...) (Let x rhs (env-to-let rest body))]))
   (match e
+    [(Void) (Void)]
     [(Var x) (Var x)]
     [(Int n) (Int n)]
     [(Bool b) (Bool b)]
-    [(Let x e body) (Let x (rco-exp e) (rco-exp body))]
+    [(Let x rhs body) (Let x (rco-exp rhs) (rco-exp body))]
     [(Prim 'read '()) (Prim 'read '())]
-    [(Prim op es)
-     (define-values (es_new env_new) (for/lists (_ __) [(e es)] (rco-atom e)))
+    [(Prim op arg*)
+     (define-values (es_new env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
      (env-to-let (append* env_new) (Prim op es_new))]
     [(If cnd thn els) (If (rco-exp cnd) (rco-exp thn) (rco-exp els))]
     [(FunRef name arity) (FunRef name arity)]
@@ -154,9 +228,12 @@
      (define-values (f_atm f_env) (rco-atom fun))
      (define-values (args_atm env_new) (for/lists (_ __) [(arg arg*)] (rco-atom arg)))
      (env-to-let (append f_env (append* env_new)) (Apply f_atm args_atm))]
-    [_ (error "Unrecognized expression (rco-exp)")]))
+    [(Collect bytes) (Collect bytes)]
+    [(Allocate bytes t) (Allocate bytes t)]
+    [(GlobalValue x) (GlobalValue (rco-atom x))]
+    [_ (error "Unrecognized expression (rco-exp)" e)]))
 
-;; remove-complex-opera* : R1 -> R1
+;; remove-complex-opera* : LmonFunRef -> LmonFunRef
 (define (remove-complex-opera* p)
   (match p
     [(ProgramDefs info functions)
@@ -177,48 +254,69 @@
 
 (define (explicate-tail e)
   (match e
+    [(Void) (Return (Void))]
     [(Var x) (Return (Var x))]
     [(Int n) (Return (Int n))]
     [(Bool b) (Return (Bool b))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-tail body))]
-    [(Prim op es) (Return (Prim op es))]
     [(If cnd thn els)
      (define thn-block (create-block (explicate-tail thn)))
      (define els-block (create-block (explicate-tail els)))
      (explicate-pred cnd thn-block els-block)]
     [(Apply fun args*) (TailCall fun args*)]
     [(FunRef name arity) (Return (FunRef name arity))]
+    [(Prim 'vector-set! es) (Seq (Prim 'vector-set! es) (Return (Void)))]
+    [(Prim op es) (Return (Prim op es))]
+    [(GlobalValue x) (Return (GlobalValue x))]
+    [(Collect bytes) (Seq (Collect bytes) (Return (Void)))]
+    [(Allocate bytes t) (Seq (Allocate bytes t) (Return (Void)))]
     [_ (error "Unrecognized expression (explicate-tail)" e)]))
 
 (define (explicate-assign e x cont)
   (match e
+    [(Void) (Seq (Assign (Var x) (Void)) cont)]
     [(Var y) (Seq (Assign (Var x) (Var y)) cont)]
     [(Int n) (Seq (Assign (Var x) (Int n)) cont)]
     [(Bool b) (Seq (Assign (Var x) (Bool b)) cont)]
     [(Let y rhs body) (explicate-assign rhs y (explicate-assign body x cont))]
+    [(Prim 'vector-set! _) (Seq e (explicate-assign (Void) x cont))]
     [(Prim op es) (Seq (Assign (Var x) (Prim op es)) cont)]
     [(If cnd thn els)
-     (define thn-block (explicate-assign thn x cont))
-     (define els-block (explicate-assign els x cont))
+     (define cont-block (create-block cont))
+     (define thn-block (explicate-assign thn x cont-block))
+     (define els-block (explicate-assign els x cont-block))
      (explicate-pred cnd thn-block els-block)]
     [(Apply fun args*) (Seq (Assign (Var x) (Call fun args*)) cont)]
     [(FunRef name arity) (Seq (Assign (Var x) (FunRef name arity)) cont)]
+    [(GlobalValue _) (Seq (Assign (Var x) e) cont)]
+    [(Allocate _ _) (Seq (Assign (Var x) e) cont)]
+    [(Collect _) (Seq e (explicate-assign (Void) x cont))]
     [_ (error "Unrecognized expression (explicate-assign)" e)]))
 
 (define (explicate-pred cnd thn els)
   (match cnd
     [(Var x) (IfStmt (Prim 'eq? (list (Var x) (Bool #t))) (create-block thn) (create-block els))]
     [(Let x rhs body) (explicate-assign rhs x (explicate-pred body thn els))]
-    [(Bool b) (if b thn els)]
+    [(Bool b) (if b (create-block thn) (create-block els))]
     [(Prim 'not (list e)) (explicate-pred e els thn)]
     [(Prim op es) #:when (or (or (or (or (eq? op 'eq?) (eq? op '<)) (eq? op '<= )) (eq? op '> )) (eq? op '>= ))
                   (IfStmt (Prim op es) (create-block thn) (create-block els))]
+    [(Prim op es)
+     (define tmpvar (gensym 'tmp))
+     (explicate-assign cnd tmpvar (IfStmt (Prim 'eq? (list (Var tmpvar) (Bool #t))) (create-block thn) (create-block els)))]
     [(If cnd^ thn^ els^)
-     (define thn-block (explicate-pred thn^ thn els))
-     (define els-block (explicate-pred els^ thn els))
-     (explicate-pred cnd^ thn-block els-block)]
+     (define thn-block (create-block thn))
+     (define els-block (create-block els))
+     (define thn-branch (explicate-pred thn^ thn-block els-block))
+     (define els-branch (explicate-pred els^ thn-block els-block))
+     (explicate-pred cnd^ thn-branch els-branch)]
     [(Apply fun args*)
-     (IfStmt (Call fun args*) (create-block thn) (create-block els))]
+     (define tmpvar (gensym 'tmp))
+     (explicate-assign cnd tmpvar 
+                       (IfStmt (Var tmpvar) (create-block thn) (create-block els)))]
+    [(GlobalValue g) (IfStmt (Prim 'eq? `(,(GlobalValue g) ,(Bool #t)))
+                             (create-block thn)
+                             (create-block els))]
     [_ (error "Unrecognized expression (explicate-pred)" cnd thn els)]))
 
 (define (explicate-control-function p)
@@ -229,10 +327,12 @@
      (dict-set! basic-blocks start-label (explicate-tail body))
      (Def name param* rty '() (hash->list basic-blocks))]))
 
-;; explicate-control : R1 -> C0
+;; explicate-control : LmonFunRef -> CFun
 (define (explicate-control p)
   (match p
     [(ProgramDefs info fun*) (ProgramDefs info (for/list ([fun fun*]) (explicate-control-function fun)))]))
+
+
 
 
 (define (select-instructions-atm atm)
@@ -240,6 +340,7 @@
     [(Int n) (Imm n)]
     [(Var x) (Var x)]
     [(Reg r) (Reg r)]
+    [(Void)  (Imm 0)]
     [(Bool b)
      (match b
        [#t (Imm 1)]
@@ -250,6 +351,15 @@
     (match op
       [(Prim '+ (list _ _)) 'addq]
       [(Prim '- (list _ _)) 'subq]))
+  (define (type-mask type [mask 0])
+    (match type
+      [(list 'Vector) mask]
+      [(list 'Vector (list 'Vector _ ...) more ...)
+       (type-mask (cons 'Vector more)
+                  (arithmetic-shift (bitwise-ior mask 1) 1))]
+      [(list 'Vector _ more ...)
+       (type-mask (cons 'Vector more) (arithmetic-shift mask 1))]
+      [_ (error "Pointer mask error" type)]))
   (match e
     [atm #:when (atm? atm) (list (Instr 'movq (list (select-instructions-atm atm) x)))]
     [(FunRef fun _) (list (Instr 'leaq (list (Global fun) x)))]
@@ -257,13 +367,28 @@
      (define arg-moves (for/list ([reg (take arguments-list (length arg*))][arg arg*])
                          (Instr 'movq (list (select-instructions-atm arg) reg))))
      (append arg-moves (list (IndirectCallq fun (length arg*)) (Instr 'movq (list (Reg 'rax) x))))]
+    [(GlobalValue var)
+     (list
+      (Instr 'movq (list (Global var) x)))]
+    [(Prim 'read '()) (list (Callq 'read_int 1) (Instr 'movq (list (Reg 'rax) x)))]
     [(Prim 'not (list e1)) #:when (equal? e1 x)
                            (list
                             (Instr 'xorq (list (Imm 1) (select-instructions-atm e1))))]
     [(Prim 'not (list e1)) (list
                             (Instr 'movq (list (select-instructions-atm e1) x))
                             (Instr 'xorq (list (Imm 1) x)))]
-    [(Prim 'read '()) (list (Callq 'read_int 1) (Instr 'movq (list (Reg 'rax) x)))]
+    [(Prim 'vector-ref (list name (Int idx)))
+     (define loc (* 8 (add1 idx)))
+     (list
+      (Instr 'movq (list (select-instructions-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 loc) (select-instructions-atm x))))]
+    [(Prim 'vector-length (list name))
+     (list
+      (Instr 'movq (list (select-instructions-atm name) (Reg 'r11)))
+      (Instr 'movq (list (Deref 'r11 0) (Reg 'rax)))
+      (Instr 'andq (list (Imm 63) (Reg 'rax)))
+      (Instr 'sarq (list (Imm 1)  (Reg 'rax)))
+      (Instr 'movq (list (Reg 'rax) (select-instructions-atm x))))]
     [(Prim '- (list e1)) #:when (equal? e1 x)
                          (list
                           (Instr 'negq (list (select-instructions-atm e1))))]
@@ -295,15 +420,36 @@
     [(Prim _ (list e1 e2)) (list
                             (Instr 'movq                  (list (select-instructions-atm e1) x))
                             (Instr (get-op-instruction e) (list (select-instructions-atm e2) x)))]
-    [_ (error "unrecognized expression (select-assign)" e)]
-    ))
+    [(Allocate len type)
+     (define loc (* 8 (add1 len)))
+     (define tag (bitwise-ior 1 (arithmetic-shift len 1) (arithmetic-shift (type-mask type) 7)))
+     (list
+      (Instr 'movq (list (Global 'free_ptr) (Reg 'r11)))
+      (Instr 'addq (list (Imm loc) (Global 'free_ptr)))
+      (Instr 'movq (list (Imm tag) (Deref 'r11 0)))
+      (Instr 'movq (list (Reg 'r11) (select-instructions-atm x))))]
+    [_ (error "unrecognized expression (select-assign)" e)]))
 
 (define (select-instructions-stmt stmt)
   (match stmt
     [(Return e) (select-assign (Reg 'rax) e)]
     [(Assign lhs rhs) (select-assign lhs rhs)]
-    [_ (error "unrecognized expression (select-instructions-stmt)" stmt)]
-    ))
+    [(Prim 'read '()) (list (Callq 'read_int 1)) ]
+    [(Prim 'vector-set! (list name (Int idx) var))
+     (define loc (* 8 (add1 idx)))
+     (list
+      (Instr 'movq (list (select-instructions-atm name) (Reg 'r11)))
+      (Instr 'movq (list (select-instructions-atm var) (Deref 'r11 loc))))]
+    [(Collect size)
+     (list
+      (Instr 'movq (list (Reg 'r15) (Reg 'rdi)))
+      (Instr 'movq (list (Imm size) (Reg 'rsi)))
+      (Callq 'collect 2))]
+    [(Call fun arg*)
+     (define arg-moves (for/list ([reg (take arguments-list (length arg*))][arg arg*])
+                         (Instr 'movq (list (select-instructions-atm arg) reg))))
+     (append arg-moves (list (IndirectCallq fun (length arg*))))]
+    [_ (error "unrecognized expression (select-instructions-stmt)" stmt)]))
 
 (define (select-instructions-tail e jmp-label)
   (match e
@@ -371,7 +517,7 @@
      (set! new-blocks (dict-set new-blocks start-label new-start-block))
      (Def name '() rty (dict-set info 'num-params  num-params) new-blocks)]))
 
-;; select-instructions : C0 -> pseudo-X86
+;; select-instructions : CFun -> x86(Var,Def)callq*
 (define (select-instructions p)
   (match p
     [(ProgramDefs info functions)
@@ -473,13 +619,22 @@
                              (cons label (Block (dict-set blkinfo 'live-after blk-live-after) blkbody))])))
      (Def name param* rty (dict-set info 'label->live label->live) new-blocks)]))
 
-;; uncover-live : pseudo-X86 -> pseudo-X86
+;; uncover-live : x86(Var,Def)callq* -> x86(Var,Def)callq*
 (define (uncover-live p)
   (match p
     [(ProgramDefs info functions) (ProgramDefs info (map uncover-live-function functions))]))
 
 
-(define (build-interference-graph instr live-after graph)
+(define (build-interference-graph instr live-after graph locals-types)
+  (define (is-vector-type? locals-types var)
+    (define label (match var [(Var x) x] [_ ""]))
+    (println label)
+    (if
+    (dict-has-key? locals-types label)
+    (match (dict-ref locals-types label)
+      [(list 'Vector _ ...) #t]
+      [_ #f])
+    #f))
   (match instr
     [(Instr 'movq (list s d))
      (when (not (Imm? s)) (add-vertex! graph s))
@@ -491,25 +646,39 @@
      (when (not (Imm? d)) (add-vertex! graph d))
      (for ([v (set-subtract live-after (set s d))])
        (add-vertex! graph v) (add-edge! graph d v))]
+    [(Callq 'collect _)
+     (for ([x live-after])
+       (if (is-vector-type? locals-types x)
+           (for ([y (append caller-saved-list callee-saved-list)])
+             (add-vertex! graph x)
+             (add-edge! graph x y))
+           (for ([y caller-save])
+             (add-vertex! graph x)
+             ;; (add-vertex! graph x)
+             (add-edge! graph x y))))]
     [_ (define w (get-write instr))
        (for* ([d w] [v (set-subtract live-after w) ])
          (add-vertex! graph v) (add-edge! graph d v))])
   graph)
 
-;; build-interference : pseudo X86 -> pseudo X86
 (define (build-interference-function p)
   (match p
     [(Def name param* rty info blocks)
      (define graph (undirected-graph '()))
+     (define locals-types (dict-ref info 'locals-types))
      (for/list ([block blocks])
        (define interference-graph
          (match block
            [(cons _ (Block blkinfo blkbody))
             (define live-after-sets (dict-ref blkinfo 'live-after))
-            (foldl build-interference-graph (undirected-graph '()) blkbody (cdr live-after-sets))]))
+            (foldl (lambda (instr live-after graph)
+                     (build-interference-graph instr live-after graph locals-types))
+                   (undirected-graph '())
+                   blkbody (cdr live-after-sets))]))
        (graph-union! graph interference-graph))
      (Def name param* rty (dict-set info 'conflicts graph) blocks)]))
 
+;; build-interference : x86(Var,Def)callq* -> x86(Var,Def)callq*
 (define (build-interference p)
   (match p
     [(ProgramDefs info functions) (ProgramDefs info (map build-interference-function functions))]))
@@ -588,7 +757,7 @@
   (if (equal? (pqueue-count q) 0) '() (dsatur '() vertex->handle vertex->saturation)))
 
 
-(define (get-location var->color)
+(define (get-var-location var->color)
   (define var (car var->color))
   (define color (cdr var->color))
   (cond
@@ -596,10 +765,19 @@
     [else                             (cons var (Deref 'rbp (* -8 (- color 10))))]
     ))
 
+(define (get-vec-location vec->color)
+  (define vec (car vec->color))
+  (define color (cdr vec->color))
+  (cond
+    [(dict-has-key? color->reg color) (cons vec (dict-ref color->reg color))]
+    [else                             (cons vec (Deref 'rbp (+ (* -8 (length callee-saved-list)) (* -8 color))))]
+    ))
+
 (define (allocate-registers-imm i var->location)
   (match i
     [(Imm n) (Imm n)]
     [(Reg r) (Reg r)]
+    [(Deref reg imm) (Deref reg imm)]
     [(Var _) (dict-ref var->location i)]
     [(Global label) (Global label)]))
 
@@ -620,25 +798,39 @@
     [_ result]))
 
 (define (allocate-registers-function p)
+  (define (Vector? v locals-types)
+    (match v
+      [(Var x)
+       (match (dict-ref locals-types x)
+         [`(Vector . ,_) #t]
+         [_ #f])]
+      [_ #f]))
   (match p
     [(Def name param* rty info blocks)
+     (define locals-types (dict-ref info 'locals-types))
      (define graph      (dict-ref info 'conflicts))
      (define variables  (dict-ref info 'locals-types))
-     (define var->color (color-graph graph variables))
-     (define var->location (map get-location var->color))
-     (define num-spilled (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 var->location))
-     (define used-callee (foldl get-used-callee (set) var->location))
+     (define all->color (color-graph graph variables))
+     (define var->color (filter (lambda (v) (not (Vector? v locals-types))) all->color))
+     (define vec->color (filter (lambda (v) (Vector? v locals-types)) all->color))
+     (define var->location (map get-var-location var->color))
+     (define vec->location (map get-vec-location vec->color))
+     (define var/vec->location (append var->location vec->location))
+     (define num-var-spilled  (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 var->location))
+     (define num-vecs-spilled (foldl (lambda (x result) (if (Deref? (cdr x)) (+ 1 result) result)) 0 vec->location))
+     (define used-callee (foldl get-used-callee (set) var/vec->location))
      (define num-callee  (set-count used-callee))
-     (define stack-space (- (align (* 8 (+ num-spilled num-callee)) 16) (* 8 num-callee)))
+     (define stack-space (- (align (* 8 (+ num-var-spilled num-callee)) 16) (* 8 num-callee)))
+     (define root-stack-space (* 8 num-vecs-spilled))
      (define new-blocks (for/list ([block blocks])
                           (match block
                             [(cons label (Block blkinfo blkbody))
                              (cons label (Block blkinfo (foldr (lambda (instr result)
-                                                                 (allocate-registers-instr instr result var->location))
+                                                                 (allocate-registers-instr instr result var/vec->location))
                                                                '() blkbody)))])))
-     (Def name param* rty (dict-set* info 'stack-space stack-space 'used-callee used-callee) new-blocks)]))
+     (Def name param* rty (dict-set* info 'stack-space stack-space 'root-stack-space root-stack-space 'used-callee used-callee) new-blocks)]))
 
-;; allocate-registers : pseudoX86 -> X86
+;; allocate-registers : x86(Var,Def)callq* -> x86(Var,Def)callq*
 (define (allocate-registers p)
   (match p
     [(ProgramDefs info functions) (ProgramDefs info (map allocate-registers-function functions))]))
@@ -674,13 +866,17 @@
                                                            (append (patch-single-instruction instr) old)) '() blkbody)))])))
      (Def name param* rty info new-blocks)]))
 
-;; patch-instructions : pseudo-X86 -> X86
+;; patch-instructions : x86(Var,Def)callq* -> x86(Def)callq*
 (define (patch-instructions p)
   (match p
     [(ProgramDefs info functions) (ProgramDefs info (map patch-instructions-function functions))]))
 
 (define (generate-prelude name info)
   (define start-label (string->symbol (~a name 'start)))
+  (define zero-out-list (for/list ([r (range 0 (quotient (dict-ref info 'root-stack-space) 8))])
+                          (Instr 'movq (list (Imm 0) (Deref 'r15 (* 8 r))))))
+  (match name
+    ['main
   (list (cons name (Block '()
                           (append
                            (list
@@ -691,7 +887,27 @@
                                 (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
                                 '())
                            (list
-                            (Jmp start-label)))))))
+                            (Jmp start-label))))))]
+    [_
+     (list (cons name (Block '()
+                             (append
+                              (list
+                               (Instr 'pushq (list (Reg 'rbp)))
+                               (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+                              (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                              (if  (> (dict-ref info 'stack-space) 0)
+                                   (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                   '())
+                              (list
+                               (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
+                               (Instr 'movq (list (Imm 65536) (Reg 'rdi)))
+                               (Instr 'movq (list (Imm 65536) (Reg 'rsi)))
+                               (Callq 'initialize 2)
+                               (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15))))
+                              zero-out-list
+                              (list (Instr 'addq (list (Imm (dict-ref info 'root-stack-space)) (Reg 'r15)))
+                              (list
+                               (Jmp start-label)))))))]))
 
 
 (define (generate-conclusion name info)
@@ -713,6 +929,9 @@
      (define (replace-tailjump instr)
        (match instr
          [(TailJmp target arity) (append
+                                  (if (> (dict-ref info 'root-stack-space) 0)
+                                      (Instr 'subq (list (Imm (dict-ref info 'root-stack-space)) (Reg 'r15)))
+                                      '())
                                   (if (> (dict-ref info 'stack-space) 0)
                                       (list (Instr 'addq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
                                       '())
@@ -728,7 +947,7 @@
      (append (generate-prelude name info) new-blocks (generate-conclusion name info))]))
 
 
-;; prelude-and-conclusion : X86 -> X86
+;; prelude-and-conclusion : x86(Def)callq* -> x86callq*
 (define (prelude-and-conclusion p)
   (match p
     [(ProgramDefs info functions)
@@ -743,14 +962,14 @@
     ;; Uncomment the following passes as you finish them.
     ("shrink" ,shrink ,interp-Lfun ,type-check-Lfun)
     ("uniquify" ,uniquify ,interp-Lfun ,type-check-Lfun)
-    ("reveal functions" ,reveal-functions ,interp-Lfun-prime , type-check-Lfun)
+    ("reveal functions" ,reveal-functions ,interp-Lfun-prime ,type-check-Lfun)
+    ("expose-allocation" ,expose-allocation ,interp-Lfun-prime ,type-check-Lfun)
     ("remove complex opera*" ,remove-complex-opera* ,interp-Lfun-prime ,type-check-Lfun)
     ("explicate control" ,explicate-control ,interp-Cfun ,type-check-Cfun)
-    ("instruction selection", select-instructions ,interp-pseudo-x86-3)
-    ("uncover live", uncover-live ,interp-pseudo-x86-3)
-    ("build interference", build-interference ,interp-pseudo-x86-3)
-    ;; ("assign homes", assign-homes ,interp-x86-0)
-    ("allocate registers", allocate-registers ,interp-x86-3)
-    ("patch instructions", patch-instructions ,interp-x86-3)
-    ("prelude and conclusion", prelude-and-conclusion ,#f)
+    ("instruction selection" ,select-instructions ,interp-pseudo-x86-3)
+    ("uncover live" ,uncover-live ,interp-pseudo-x86-3)
+    ("build interference" ,build-interference ,interp-pseudo-x86-3)
+    ("allocate registers" ,allocate-registers ,interp-x86-3)
+    ("patch instructions" ,patch-instructions ,interp-x86-3)
+    ("prelude and conclusion" ,prelude-and-conclusion ,#f)
     ))
