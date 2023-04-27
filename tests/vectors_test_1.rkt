@@ -1,2 +1,1 @@
-(let ([v (vector 1 2)])
-  42)
+(vector-ref (vector-ref (vector (vector 42)) 0) 0)

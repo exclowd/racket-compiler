@@ -26,10 +26,10 @@
     [(HasType expr type) (HasType (shrink-exp expr) type)]
     [(Prim 'and (list arg1 arg2)) (let ([e1 (shrink-exp arg1)]
                                         [e2 (shrink-exp arg2)])
-                                    (If arg1 arg2 (Bool #f)))]
+                                    (If e1 e2 (Bool #f)))]
     [(Prim 'or (list arg1 arg2))  (let ([e1 (shrink-exp arg1)]
                                         [e2 (shrink-exp arg2)])
-                                    (If arg1 (Bool #t) arg2))]
+                                    (If e1 (Bool #t) e2))]
     [(Prim 'vector-ref  (list vec (Int i)))     (Prim 'vector-ref  (list (shrink-exp vec) (Int i)))]
     [(Prim 'vector-set! (list vec (Int i) val)) (Prim 'vector-set! (list (shrink-exp vec) (Int i) (shrink-exp val)))]
     [(Prim op arg*) (Prim op (map shrink-exp arg*))]
@@ -142,6 +142,7 @@
                           (expose-allocation-exp thn)
                           (expose-allocation-exp els))]
     [(Apply fun arg*) (Apply (expose-allocation-exp fun) (map expose-allocation-exp arg*))]
+    [(FunRef f n) (FunRef f n)]
     [(HasType (Prim 'vector arg*) type)
      (define nargs (length arg*))
      (define vector-arg* (for/list ([arg arg*]) (cons (gensym 'vector-arg) (expose-allocation-exp arg))))
@@ -290,7 +291,7 @@
     [(FunRef name arity) (Seq (Assign (Var x) (FunRef name arity)) cont)]
     [(GlobalValue _) (Seq (Assign (Var x) e) cont)]
     [(Allocate _ _) (Seq (Assign (Var x) e) cont)]
-    [(Collect _) (Seq e (explicate-assign (Void) x cont))]
+    [(Collect _) (Seq e cont)]
     [_ (error "Unrecognized expression (explicate-assign)" e)]))
 
 (define (explicate-pred cnd thn els)
@@ -351,15 +352,14 @@
     (match op
       [(Prim '+ (list _ _)) 'addq]
       [(Prim '- (list _ _)) 'subq]))
-  (define (type-mask type [mask 0])
-    (match type
-      [(list 'Vector) mask]
-      [(list 'Vector (list 'Vector _ ...) more ...)
-       (type-mask (cons 'Vector more)
-                  (arithmetic-shift (bitwise-ior mask 1) 1))]
-      [(list 'Vector _ more ...)
-       (type-mask (cons 'Vector more) (arithmetic-shift mask 1))]
-      [_ (error "Pointer mask error" type)]))
+  (define (type-mask t [mask 0])
+    (match t
+      [`(Vector) mask]
+      [`(Vector (Vector . ,_)) (bitwise-ior mask 1)]
+      [`(Vector ,_) mask]
+      [`(Vector . ((Vector . ,_) . ,rest)) (type-mask `(Vector . ,rest) (arithmetic-shift (bitwise-ior mask 1) 1))]
+      [`(Vector . (,t . ,rest)) (type-mask `(Vector . ,rest) (arithmetic-shift mask 1))]
+      [else (error "Type Mask Error" t)]))
   (match e
     [atm #:when (atm? atm) (list (Instr 'movq (list (select-instructions-atm atm) x)))]
     [(FunRef fun _) (list (Instr 'leaq (list (Global fun) x)))]
@@ -876,38 +876,34 @@
   (define zero-out-list (for/list ([r (range 0 (quotient (dict-ref info 'root-stack-space) 8))])
                           (Instr 'movq (list (Imm 0) (Deref 'r15 (* 8 r))))))
   (match name
-    ['main
-  (list (cons name (Block '()
-                          (append
-                           (list
-                            (Instr 'pushq (list (Reg 'rbp)))
-                            (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
-                           (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
-                           (if  (> (dict-ref info 'stack-space) 0)
-                                (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
-                                '())
-                           (list
-                            (Jmp start-label))))))]
-    [_
-     (list (cons name (Block '()
-                             (append
-                              (list
-                               (Instr 'pushq (list (Reg 'rbp)))
-                               (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
-                              (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
-                              (if  (> (dict-ref info 'stack-space) 0)
-                                   (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
-                                   '())
-                              (list
-                               (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp)))
-                               (Instr 'movq (list (Imm 65536) (Reg 'rdi)))
-                               (Instr 'movq (list (Imm 65536) (Reg 'rsi)))
-                               (Callq 'initialize 2)
-                               (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15))))
-                              zero-out-list
-                              (list (Instr 'addq (list (Imm (dict-ref info 'root-stack-space)) (Reg 'r15)))
-                              (list
-                               (Jmp start-label)))))))]))
+    ['main (list (cons name (Block '()
+                                   (append
+                                    (list
+                                     (Instr 'pushq (list (Reg 'rbp)))
+                                     (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+                                    (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                                    (if  (> (dict-ref info 'stack-space) 0)
+                                         (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                         '())
+                                    (list
+                                     (Instr 'movq (list (Imm 65536) (Reg 'rdi)))
+                                     (Instr 'movq (list (Imm 65536) (Reg 'rsi)))
+                                     (Callq 'initialize 2)
+                                     (Instr 'movq (list (Global 'rootstack_begin) (Reg 'r15))))
+                                    zero-out-list
+                                    (list (Instr 'addq (list (Imm (dict-ref info 'root-stack-space)) (Reg 'r15))))
+                                    (list (Jmp start-label))))))]
+    [_ (list (cons name (Block '()
+                               (append
+                                (list
+                                 (Instr 'pushq (list (Reg 'rbp)))
+                                 (Instr 'movq (list (Reg 'rsp) (Reg 'rbp))))
+                                (foldl (lambda (r res) (cons (Instr 'pushq (list r)) res)) '() (set->list (dict-ref info 'used-callee)) )
+                                (if  (> (dict-ref info 'stack-space) 0)
+                                     (list (Instr 'subq (list (Imm (dict-ref info 'stack-space)) (Reg 'rsp))))
+                                     '())
+                                (list
+                                 (Jmp start-label))))))]))
 
 
 (define (generate-conclusion name info)
