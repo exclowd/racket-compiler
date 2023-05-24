@@ -550,6 +550,7 @@
 (define (get-write instr)
   (match instr
     [(Instr 'addq (list _ arg2))    (set-union (uncover-live-arg arg2))]
+    [(Instr 'subq (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Instr 'movq (list _ arg2))    (set-union (uncover-live-arg arg2))]
     [(Instr 'movzbq (list _ arg2))  (set-union (uncover-live-arg arg2))]
     [(Instr 'negq (list arg1))      (set-union (uncover-live-arg arg1))]
@@ -564,6 +565,7 @@
 (define (get-read instr)
   (match instr
     [(Instr 'addq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
+    [(Instr 'subq (list arg1 arg2)) (set-union (uncover-live-arg arg1) (uncover-live-arg arg2))]
     [(Instr 'movq (list arg1 _))    (set-union (uncover-live-arg arg1))]
     [(Instr 'movzbq (list arg1 _))    (set-union (uncover-live-arg arg1))]
     [(Instr 'negq (list arg))       (set-union (uncover-live-arg arg))]
